@@ -9,7 +9,8 @@ local function storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp)
   local priority = opts['priority'] or 0
 
   rcall("HMSET", jobIdKey, "name", name, "data", data, "opts", jsonOpts,
-        "timestamp", timestamp, "delay", delay, "priority", priority)
+        "timestamp", timestamp, "delay", delay, "priority", priority,
+        "atm", 0, "ats", 0)
 
   rcall("XADD", eventsKey, "*", "event", "added", "jobId", jobId, "name", name)
 

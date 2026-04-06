@@ -141,7 +141,7 @@ if fetchNext == 1 then
 
   rcall("SET", nextLockKey, token, "PX", lockDuration)
   rcall("SADD", stalledKey, nextJobId)
-  rcall("HSET", nextJobKey, "ats", timestamp)
+  rcall("HINCRBY", nextJobKey, "ats", 1)
 
   rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*",
         "event", "active", "jobId", nextJobId, "prev", "waiting")

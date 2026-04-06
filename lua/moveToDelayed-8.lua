@@ -15,6 +15,7 @@
   ARGV[3] = jobId
   ARGV[4] = delayedTimestamp (target time ms)
   ARGV[5] = maxEvents
+  ARGV[6] = attemptsMade
 
   Returns:
     0  on success
@@ -44,6 +45,7 @@ local timestamp = ARGV[2]
 local jobId = ARGV[3]
 local delayedTimestamp = tonumber(ARGV[4])
 local maxEvents = tonumber(ARGV[5]) or 10000
+local attemptsMade = ARGV[6] or "0"
 
 -- 1. Check job exists
 if rcall("EXISTS", jobKey) ~= 1 then
@@ -60,12 +62,11 @@ end
 rcall("LREM", activeKey, 1, jobId)
 
 -- 4. Compute delayed score and add to delayed set
-local delay = tonumber(rcall("HGET", jobKey, "delay")) or 0
-local score = getDelayedScore(delayedKey, timestamp, delay)
+local score = getDelayedScore(delayedKey, delayedTimestamp, 0)
 rcall("ZADD", delayedKey, score, jobId)
 
 -- 5. Update job hash
-rcall("HSET", jobKey, "delay", delayedTimestamp - tonumber(timestamp))
+rcall("HSET", jobKey, "delay", delayedTimestamp - tonumber(timestamp), "atm", attemptsMade)
 
 -- 6. Emit delayed event
 rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*",

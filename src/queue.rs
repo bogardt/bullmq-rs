@@ -468,8 +468,8 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             &self.name,
             job_id,
             log_line,
-            // No limit by default; use u64::MAX as "unlimited".
-            u64::MAX,
+            // 0 means unlimited (Lua script checks > 0 before LTRIM).
+            0,
         )
         .await
     }

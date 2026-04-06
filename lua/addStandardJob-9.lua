@@ -52,9 +52,13 @@ local delay, priority = storeJob(eventsKey, jobIdKey, jobId, name, data, opts, t
 -- Check if paused
 local paused = rcall("HEXISTS", metaKey, "paused") == 1
 
--- Push to wait list (LIFO push = LPUSH, so newest jobs are processed first;
--- use RPUSH if you want strict FIFO)
-rcall("LPUSH", waitKey, jobId)
+-- Push to wait list or paused list depending on queue state
+local targetKey = waitKey
+if paused then
+  -- Derive paused key: replace ":wait" suffix with ":paused"
+  targetKey = string.gsub(waitKey, ":wait$", ":paused")
+end
+rcall("LPUSH", targetKey, jobId)
 
 -- Emit waiting event
 rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*",

@@ -88,8 +88,8 @@ rcall("SET", lockKey, token, "PX", lockDuration)
 -- Add to stalled set (will be removed when lock is extended)
 rcall("SADD", stalledKey, jobId)
 
--- Update job state
-rcall("HSET", jobKey, "ats", timestamp)
+-- Increment attempts started counter
+rcall("HINCRBY", jobKey, "ats", 1)
 
 -- Emit active event
 rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*",

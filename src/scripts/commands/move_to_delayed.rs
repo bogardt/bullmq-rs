@@ -17,6 +17,7 @@ pub(crate) async fn move_to_delayed(
     timestamp: u64,
     delayed_timestamp: u64,
     max_events: u64,
+    attempts_made: u32,
 ) -> BullmqResult<()> {
     let job_key = format!("{}:{}:{}", prefix, queue_name, job_id);
     let lock_key = format!("{}:lock", job_key);
@@ -37,6 +38,7 @@ pub(crate) async fn move_to_delayed(
         job_id.as_bytes().to_vec(),
         delayed_timestamp.to_string().into_bytes(),
         max_events.to_string().into_bytes(),
+        attempts_made.to_string().into_bytes(),
     ];
 
     let result = loader

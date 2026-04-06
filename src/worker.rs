@@ -268,15 +268,54 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                         Some(result)
                     } else {
                         // BZPOPMIN on the marker key with 5-second timeout.
-                        let bzpopmin_result: redis::RedisResult<Option<(String, String, f64)>> =
+                        let bzpopmin_result: redis::RedisResult<redis::Value> =
                             redis::cmd("BZPOPMIN")
                                 .arg(&marker_key)
                                 .arg(5.0_f64)
                                 .query_async(&mut blocking_conn)
                                 .await;
 
-                        match bzpopmin_result {
-                            Ok(Some((_key, member, score))) => {
+                        // Parse BZPOPMIN response manually:
+                        // - Nil or empty array = timeout
+                        // - Array of [key, member, score] = got a marker
+                        let parsed = match &bzpopmin_result {
+                            Ok(redis::Value::Array(items)) if items.len() >= 3 => {
+                                let member = match &items[1] {
+                                    redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),
+                                    redis::Value::SimpleString(s) => s.clone(),
+                                    _ => String::new(),
+                                };
+                                let score = match &items[2] {
+                                    redis::Value::BulkString(b) => String::from_utf8_lossy(b).parse::<f64>().unwrap_or(0.0),
+                                    redis::Value::Double(f) => *f,
+                                    redis::Value::Int(i) => *i as f64,
+                                    _ => 0.0,
+                                };
+                                Some((member, score))
+                            }
+                            Ok(redis::Value::Nil) | Ok(redis::Value::Array(_)) => None,
+                            Ok(_) => None,
+                            Err(_) => None,
+                        };
+
+                        // Check if the original result was a real error (not a timeout)
+                        if let Err(ref e) = bzpopmin_result {
+                            // Timeouts and type errors (Nil response) are normal for BZPOPMIN
+                            let msg = e.to_string();
+                            if msg.contains("timed out") || msg.contains("response was nil") ||
+                               msg.contains("not compatible") {
+                                continue;
+                            }
+                            tracing::warn!("BZPOPMIN error: {}, retrying after delay", e);
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                                _ = shutdown_rx.changed() => break,
+                            }
+                            continue;
+                        }
+
+                        match parsed {
+                            Some((member, score)) => {
                                 if member == "0" {
                                     // Score 0 means a job is available: call moveToActive.
                                     let timestamp = now_ms();
@@ -306,7 +345,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                     }
                                 } else if member == "1" {
                                     // Score is a timestamp for a delayed job.
-                                    // Sleep until that time (or at most 5s), then continue.
+                                    // Sleep until that time, then call moveToActive (which promotes delayed jobs).
                                     let now = now_ms();
                                     let target = score as u64;
                                     if target > now {
@@ -316,7 +355,27 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             _ = shutdown_rx.changed() => break,
                                         }
                                     }
-                                    continue;
+                                    // After sleeping, call moveToActive to promote and fetch delayed jobs
+                                    let timestamp = now_ms();
+                                    match move_to_active::move_to_active(
+                                        &scripts,
+                                        &mut cmd_conn,
+                                        &prefix,
+                                        &name,
+                                        &token,
+                                        lock_duration_ms,
+                                        timestamp,
+                                        DEFAULT_MAX_EVENTS,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) if result.job_id.is_some() => Some(result),
+                                        Ok(_) => { continue; }
+                                        Err(e) => {
+                                            tracing::warn!("moveToActive error after delay: {}", e);
+                                            continue;
+                                        }
+                                    }
                                 } else {
                                     // Unknown marker member, treat as a regular job marker.
                                     // Call moveToActive just in case.
@@ -342,16 +401,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                     }
                                 }
                             }
-                            Ok(None) => {
+                            None => {
                                 // Timeout, no marker appeared. Continue the loop.
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!("BZPOPMIN error: {}, retrying after delay", e);
-                                tokio::select! {
-                                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
-                                    _ = shutdown_rx.changed() => break,
-                                }
                                 continue;
                             }
                         }
@@ -485,6 +536,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                                 timestamp,
                                                 delayed_timestamp,
                                                 DEFAULT_MAX_EVENTS,
+                                                new_attempts,
                                             )
                                             .await
                                             {
