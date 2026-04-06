@@ -30,10 +30,10 @@ pub mod connection;
 pub mod error;
 pub mod types;
 
-// These modules are temporarily disabled during the v2 rewrite.
-// They depend on chrono and old type signatures that are being replaced.
-#[cfg(any())]
 pub mod job;
+
+// These modules are temporarily disabled during the v2 rewrite.
+// They depend on old type signatures that are being replaced.
 #[cfg(any())]
 pub mod queue;
 #[cfg(any())]
@@ -41,4 +41,5 @@ pub mod worker;
 
 pub use connection::RedisConnection;
 pub use error::{BullmqError, BullmqResult};
+pub use job::Job;
 pub use types::{BackoffStrategy, JobOptions, JobState, WorkerOptions};
