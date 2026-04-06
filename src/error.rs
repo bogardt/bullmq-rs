@@ -19,6 +19,8 @@ pub enum BullmqError {
     ScriptError(String),
     /// Generic error.
     Other(String),
+    /// Feature not yet implemented.
+    NotImplemented(String),
 }
 
 impl fmt::Display for BullmqError {
@@ -34,6 +36,7 @@ impl fmt::Display for BullmqError {
             BullmqError::QueuePaused => write!(f, "Queue is paused"),
             BullmqError::ScriptError(msg) => write!(f, "Script error: {}", msg),
             BullmqError::Other(msg) => write!(f, "{}", msg),
+            BullmqError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
         }
     }
 }
