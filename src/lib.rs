@@ -31,6 +31,7 @@ pub mod error;
 pub mod types;
 
 pub mod job;
+pub(crate) mod scripts;
 
 // These modules are temporarily disabled during the v2 rewrite.
 // They depend on old type signatures that are being replaced.
