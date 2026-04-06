@@ -8,6 +8,8 @@ pub enum JobState {
     Wait,
     #[serde(rename = "paused")]
     Paused,
+    #[serde(rename = "prioritized")]
+    Prioritized,
     #[serde(rename = "waiting-children")]
     WaitingChildren,
     #[serde(rename = "delayed")]
@@ -25,6 +27,7 @@ impl std::fmt::Display for JobState {
         match self {
             JobState::Wait => write!(f, "wait"),
             JobState::Paused => write!(f, "paused"),
+            JobState::Prioritized => write!(f, "prioritized"),
             JobState::WaitingChildren => write!(f, "waiting-children"),
             JobState::Delayed => write!(f, "delayed"),
             JobState::Active => write!(f, "active"),
@@ -41,6 +44,7 @@ impl std::str::FromStr for JobState {
         match s {
             "wait" => Ok(JobState::Wait),
             "paused" => Ok(JobState::Paused),
+            "prioritized" => Ok(JobState::Prioritized),
             "waiting-children" => Ok(JobState::WaitingChildren),
             "delayed" => Ok(JobState::Delayed),
             "active" => Ok(JobState::Active),
