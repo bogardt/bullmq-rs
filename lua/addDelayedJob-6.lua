@@ -15,6 +15,8 @@
   ARGV[5] = opts (JSON string)
   ARGV[6] = maxEvents
   ARGV[7] = delayedTimestamp (the target timestamp when the job should run)
+  ARGV[8] = parentKey (optional)
+  ARGV[9] = parent (optional)
 
   Returns: jobId
 
@@ -40,6 +42,15 @@ local jobId = ARGV[4]
 local opts = cjson.decode(ARGV[5])
 local maxEvents = tonumber(ARGV[6]) or 10000
 local delayedTimestamp = tonumber(ARGV[7])
+local parentKey = ARGV[8]
+local parentData = ARGV[9]
+
+if parentKey == "" then
+  parentKey = nil
+end
+if parentData == "" then
+  parentData = nil
+end
 
 -- Idempotent: if job hash already exists, return the jobId
 if rcall("EXISTS", jobIdKey) == 1 then
@@ -47,7 +58,7 @@ if rcall("EXISTS", jobIdKey) == 1 then
 end
 
 local delay = opts['delay'] or 0
-storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp)
+storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp, parentKey, parentData)
 
 local score = getDelayedScore(delayedKey, timestamp, delay)
 rcall("ZADD", delayedKey, score, jobId)

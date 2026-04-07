@@ -1345,6 +1345,75 @@ async fn test_job_remove() {
 }
 
 // ---------------------------------------------------------------------------
+// 19. test_flow_add_same_queue_parent_enters_waiting_children
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_flow_add_same_queue_parent_enters_waiting_children() {
+    let qname = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let producer = FlowProducerBuilder::new()
+        .connection(conn.clone())
+        .build()
+        .await
+        .unwrap();
+
+    let flow = FlowJob {
+        name: "parent".into(),
+        queue_name: qname.clone(),
+        data: TestJob {
+            value: "parent".into(),
+        },
+        prefix: None,
+        opts: None,
+        children: vec![FlowJob {
+            name: "child".into(),
+            queue_name: qname.clone(),
+            data: TestJob {
+                value: "child".into(),
+            },
+            prefix: None,
+            opts: None,
+            children: vec![],
+        }],
+    };
+
+    let node = producer.add(flow).await.unwrap();
+
+    assert_eq!(node.children.len(), 1);
+    assert_eq!(queue.get_waiting_children_count().await.unwrap(), 1);
+    assert_eq!(queue.get_waiting_count().await.unwrap(), 1);
+
+    let parent_key = format!("bull:{}:{}", qname, node.job.id);
+    let child_key = format!("bull:{}:{}", qname, node.children[0].job.id);
+
+    let mut raw = raw_redis_conn().await;
+    let deps: Vec<String> = redis::cmd("SMEMBERS")
+        .arg(format!("{parent_key}:dependencies"))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(deps, vec![child_key.clone()]);
+
+    let parent_meta: (Option<String>, Option<String>) = redis::cmd("HMGET")
+        .arg(child_key)
+        .arg("parentKey")
+        .arg("parent")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(parent_meta.0.as_deref(), Some(parent_key.as_str()));
+}
+
+// ---------------------------------------------------------------------------
 // 22. test_worker_processes_preexisting_jobs
 // ---------------------------------------------------------------------------
 

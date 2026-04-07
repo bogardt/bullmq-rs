@@ -17,6 +17,8 @@
   ARGV[4] = jobId
   ARGV[5] = opts (JSON string)
   ARGV[6] = maxEvents
+  ARGV[7] = parentKey (optional)
+  ARGV[8] = parent (optional)
 
   Returns: jobId
 
@@ -41,13 +43,23 @@ local timestamp = ARGV[3]
 local jobId = ARGV[4]
 local opts = cjson.decode(ARGV[5])
 local maxEvents = tonumber(ARGV[6]) or 10000
+local parentKey = ARGV[7]
+local parentData = ARGV[8]
+
+if parentKey == "" then
+  parentKey = nil
+end
+if parentData == "" then
+  parentData = nil
+end
 
 -- Idempotent: if job hash already exists, return the jobId
 if rcall("EXISTS", jobIdKey) == 1 then
   return jobId
 end
 
-local delay, priority = storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp)
+local delay, priority = storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp,
+                                 parentKey, parentData)
 
 -- Check if paused
 local paused = rcall("HEXISTS", metaKey, "paused") == 1

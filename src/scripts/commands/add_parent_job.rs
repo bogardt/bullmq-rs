@@ -5,11 +5,9 @@ use crate::scripts::ScriptLoader;
 
 use super::key;
 
-/// Add a delayed job to the queue.
-///
-/// Returns the job ID on success.
+/// Add a parent job directly into the waiting-children state.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn add_delayed_job(
+pub(crate) async fn add_parent_job(
     loader: &ScriptLoader,
     conn: &mut ConnectionManager,
     prefix: &str,
@@ -20,49 +18,17 @@ pub(crate) async fn add_delayed_job(
     timestamp: u64,
     opts_json: &str,
     max_events: u64,
-    delayed_timestamp: u64,
+    parent: Option<(&str, &str, &str)>,
 ) -> BullmqResult<String> {
-    add_delayed_job_with_parent(
-        loader,
-        conn,
-        prefix,
-        queue_name,
-        job_id,
-        name,
-        data,
-        timestamp,
-        opts_json,
-        max_events,
-        delayed_timestamp,
-        None,
-    )
-    .await
-}
-
-/// Add a delayed job with optional flow parent metadata.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn add_delayed_job_with_parent(
-    loader: &ScriptLoader,
-    conn: &mut ConnectionManager,
-    prefix: &str,
-    queue_name: &str,
-    job_id: &str,
-    name: &str,
-    data: &str,
-    timestamp: u64,
-    opts_json: &str,
-    max_events: u64,
-    delayed_timestamp: u64,
-    parent: Option<(&str, &str)>,
-) -> BullmqResult<String> {
-    let (parent_key, parent_data) = parent.unwrap_or(("", ""));
+    let (parent_dependencies_key, parent_key, parent_data) =
+        parent.unwrap_or(("", "", ""));
     let keys = vec![
-        key(prefix, queue_name, "delayed"),
+        key(prefix, queue_name, "waiting-children"),
         key(prefix, queue_name, "meta"),
         key(prefix, queue_name, "id"),
         key(prefix, queue_name, "events"),
-        key(prefix, queue_name, "marker"),
         format!("{}:{}:{}", prefix, queue_name, job_id),
+        parent_dependencies_key.to_string(),
     ];
     let args: Vec<Vec<u8>> = vec![
         name.as_bytes().to_vec(),
@@ -71,11 +37,10 @@ pub(crate) async fn add_delayed_job_with_parent(
         job_id.as_bytes().to_vec(),
         opts_json.as_bytes().to_vec(),
         max_events.to_string().into_bytes(),
-        delayed_timestamp.to_string().into_bytes(),
         parent_key.as_bytes().to_vec(),
         parent_data.as_bytes().to_vec(),
     ];
-    let result = loader.invoke("addDelayedJob", conn, &keys, &args).await?;
+    let result = loader.invoke("addParentJob", conn, &keys, &args).await?;
     match result {
         redis::Value::BulkString(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
         redis::Value::SimpleString(s) => Ok(s),

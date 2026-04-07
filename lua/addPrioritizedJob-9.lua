@@ -19,6 +19,8 @@
   ARGV[6] = maxEvents
   ARGV[7] = prioritizedKey
   ARGV[8] = priorityCounterKey
+  ARGV[9] = parentKey (optional)
+  ARGV[10] = parent (optional)
 
   Returns: jobId
 
@@ -46,13 +48,23 @@ local opts = cjson.decode(ARGV[5])
 local maxEvents = tonumber(ARGV[6]) or 10000
 local prioritizedKey = ARGV[7]
 local pcKey = ARGV[8]
+local parentKey = ARGV[9]
+local parentData = ARGV[10]
+
+if parentKey == "" then
+  parentKey = nil
+end
+if parentData == "" then
+  parentData = nil
+end
 
 -- Idempotent: if job hash already exists, return the jobId
 if rcall("EXISTS", jobIdKey) == 1 then
   return jobId
 end
 
-local delay, priority = storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp)
+local delay, priority = storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp,
+                                 parentKey, parentData)
 
 -- Add to prioritized sorted set
 local score = getPriorityScore(priority, pcKey)

@@ -21,6 +21,29 @@ pub(crate) async fn add_standard_job(
     opts_json: &str,
     max_events: u64,
 ) -> BullmqResult<String> {
+    add_standard_job_with_parent(
+        loader, conn, prefix, queue_name, job_id, name, data, timestamp, opts_json, max_events,
+        None,
+    )
+    .await
+}
+
+/// Add a standard job with optional flow parent metadata.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn add_standard_job_with_parent(
+    loader: &ScriptLoader,
+    conn: &mut ConnectionManager,
+    prefix: &str,
+    queue_name: &str,
+    job_id: &str,
+    name: &str,
+    data: &str,
+    timestamp: u64,
+    opts_json: &str,
+    max_events: u64,
+    parent: Option<(&str, &str)>,
+) -> BullmqResult<String> {
+    let (parent_key, parent_data) = parent.unwrap_or(("", ""));
     let keys = vec![
         key(prefix, queue_name, "wait"),
         key(prefix, queue_name, "meta"),
@@ -39,6 +62,8 @@ pub(crate) async fn add_standard_job(
         job_id.as_bytes().to_vec(),
         opts_json.as_bytes().to_vec(),
         max_events.to_string().into_bytes(),
+        parent_key.as_bytes().to_vec(),
+        parent_data.as_bytes().to_vec(),
     ];
     let result = loader.invoke("addStandardJob", conn, &keys, &args).await?;
     match result {

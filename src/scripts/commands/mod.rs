@@ -1,3 +1,4 @@
+pub(crate) mod add_parent_job;
 pub(crate) mod add_delayed_job;
 pub(crate) mod add_log;
 pub(crate) mod add_prioritized_job;

@@ -51,6 +51,7 @@ impl ScriptLoader {
         register!("addStandardJob", "addStandardJob-9.lua");
         register!("addPrioritizedJob", "addPrioritizedJob-9.lua");
         register!("addDelayedJob", "addDelayedJob-6.lua");
+        register!("addParentJob", "addParentJob-6.lua");
         register!("moveToActive", "moveToActive-11.lua");
         register!("moveToFinished", "moveToFinished-14.lua");
         register!("moveToDelayed", "moveToDelayed-8.lua");
@@ -107,6 +108,15 @@ impl ScriptLoader {
         let result: redis::Value = invocation.invoke_async(conn).await?;
         Ok(result)
     }
+
+    pub async fn load(&self, name: &str, conn: &mut ConnectionManager) -> BullmqResult<()> {
+        let script = self
+            .scripts
+            .get(name)
+            .ok_or_else(|| BullmqError::ScriptError(format!("Unknown script: {}", name)))?;
+        script.prepare_invoke().load_async(conn).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +161,7 @@ mod tests {
         assert!(loader.scripts.contains_key("addStandardJob"));
         assert!(loader.scripts.contains_key("addPrioritizedJob"));
         assert!(loader.scripts.contains_key("addDelayedJob"));
+        assert!(loader.scripts.contains_key("addParentJob"));
         assert!(loader.scripts.contains_key("moveToActive"));
         assert!(loader.scripts.contains_key("moveToFinished"));
         assert!(loader.scripts.contains_key("moveToDelayed"));
@@ -161,6 +172,6 @@ mod tests {
         assert!(loader.scripts.contains_key("addLog"));
         assert!(loader.scripts.contains_key("changePriority"));
         assert!(loader.scripts.contains_key("promote"));
-        assert_eq!(loader.scripts.len(), 13);
+        assert_eq!(loader.scripts.len(), 14);
     }
 }
