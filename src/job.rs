@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use redis::aio::ConnectionManager;
 use serde::de::DeserializeOwned;
@@ -640,5 +641,35 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             self.priority,
         )
         .await
+    }
+
+    /// Wait until this job is finished (completed or failed).
+    ///
+    /// **Not yet implemented.** Requires QueueEvents subsystem.
+    pub async fn wait_until_finished(
+        &self,
+        _ttl: Option<Duration>,
+    ) -> BullmqResult<serde_json::Value> {
+        Err(BullmqError::NotImplemented(
+            "waitUntilFinished requires QueueEvents (not yet implemented)".into(),
+        ))
+    }
+
+    /// Get this job's dependencies.
+    ///
+    /// **Not yet implemented.** Requires Flows subsystem.
+    pub async fn get_dependencies(&self) -> BullmqResult<serde_json::Value> {
+        Err(BullmqError::NotImplemented(
+            "getDependencies requires Flows (not yet implemented)".into(),
+        ))
+    }
+
+    /// Get the return values of this job's children.
+    ///
+    /// **Not yet implemented.** Requires Flows subsystem.
+    pub async fn get_children_values(&self) -> BullmqResult<serde_json::Value> {
+        Err(BullmqError::NotImplemented(
+            "getChildrenValues requires Flows (not yet implemented)".into(),
+        ))
     }
 }

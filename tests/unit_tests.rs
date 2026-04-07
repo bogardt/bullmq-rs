@@ -420,6 +420,43 @@ fn test_job_v2_from_redis_hash_missing_optional_fields() {
 }
 
 // ---------------------------------------------------------------------------
+// Disconnected job error tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_job_methods_without_context_return_error() {
+    let mut job = Job::new("1".into(), "test".into(), "data".to_string(), None);
+
+    let err = job.update_progress(serde_json::json!(1)).await.unwrap_err();
+    assert!(err.to_string().contains("no connection context"));
+
+    let err = job.log("test").await.unwrap_err();
+    assert!(err.to_string().contains("no connection context"));
+
+    let err = job.update_data("new".to_string()).await.unwrap_err();
+    assert!(err.to_string().contains("no connection context"));
+
+    let err = job.get_state().await.unwrap_err();
+    assert!(err.to_string().contains("no connection context"));
+
+    let err = job.remove().await.unwrap_err();
+    assert!(err.to_string().contains("no connection context"));
+
+    let err = job.clear_logs().await.unwrap_err();
+    assert!(err.to_string().contains("no connection context"));
+
+    // Stubs return NotImplemented (they check this before ctx)
+    let err = job.wait_until_finished(None).await.unwrap_err();
+    assert!(err.to_string().contains("Not implemented"));
+
+    let err = job.get_dependencies().await.unwrap_err();
+    assert!(err.to_string().contains("Not implemented"));
+
+    let err = job.get_children_values().await.unwrap_err();
+    assert!(err.to_string().contains("Not implemented"));
+}
+
+// ---------------------------------------------------------------------------
 // WorkerOptions tests
 // ---------------------------------------------------------------------------
 

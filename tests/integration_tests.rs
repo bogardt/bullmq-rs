@@ -967,6 +967,33 @@ async fn test_job_promote() {
 }
 
 // ---------------------------------------------------------------------------
+// 21. test_job_stubs_not_implemented
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_stubs_not_implemented() {
+    let queue = QueueBuilder::new(&unique_queue_name())
+        .connection(redis_conn())
+        .build::<String>()
+        .await
+        .unwrap();
+
+    let job = queue.add("test", "data".to_string(), None).await.unwrap();
+
+    let err = job.wait_until_finished(None).await.unwrap_err();
+    assert!(err.to_string().contains("Not implemented"));
+
+    let err = job.get_dependencies().await.unwrap_err();
+    assert!(err.to_string().contains("Not implemented"));
+
+    let err = job.get_children_values().await.unwrap_err();
+    assert!(err.to_string().contains("Not implemented"));
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // 18. test_job_remove
 // ---------------------------------------------------------------------------
 
