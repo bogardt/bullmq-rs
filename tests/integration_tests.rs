@@ -895,6 +895,78 @@ async fn test_concurrent_workers() {
 }
 
 // ---------------------------------------------------------------------------
+// 19. test_job_change_priority
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_change_priority() {
+    let conn = RedisConnection::new(
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+    );
+    let queue = QueueBuilder::new(&unique_queue_name())
+        .connection(conn)
+        .build::<String>()
+        .await
+        .unwrap();
+
+    // Add a standard (priority=0) job — goes to wait list
+    let mut job = queue.add("test", "data".to_string(), None).await.unwrap();
+    assert_eq!(job.priority, 0);
+
+    // Change priority to 5 — should move to prioritized set
+    job.change_priority(5).await.unwrap();
+    assert_eq!(job.priority, 5);
+
+    // Verify it's now in prioritized state
+    let state = job.get_state().await.unwrap();
+    assert_eq!(state, JobState::Prioritized);
+
+    // Change back to 0 — should move to wait list
+    job.change_priority(0).await.unwrap();
+    assert_eq!(job.priority, 0);
+
+    let state = job.get_state().await.unwrap();
+    assert_eq!(state, JobState::Wait);
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 20. test_job_promote
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_promote() {
+    let conn = RedisConnection::new(
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+    );
+    let queue = QueueBuilder::new(&unique_queue_name())
+        .connection(conn)
+        .build::<String>()
+        .await
+        .unwrap();
+
+    let opts = JobOptions {
+        delay: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    };
+    let mut job = queue.add("test", "data".to_string(), Some(opts)).await.unwrap();
+
+    let state = job.get_state().await.unwrap();
+    assert_eq!(state, JobState::Delayed);
+
+    job.promote().await.unwrap();
+    assert_eq!(job.delay, 0);
+
+    let state = job.get_state().await.unwrap();
+    assert_eq!(state, JobState::Wait);
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // 18. test_job_remove
 // ---------------------------------------------------------------------------
 

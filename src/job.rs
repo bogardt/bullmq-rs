@@ -566,6 +566,54 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
         Ok(())
     }
 
+    /// Change the priority of this job.
+    ///
+    /// If priority > 0, moves job to the prioritized sorted set.
+    /// If priority == 0, moves job back to the wait list.
+    pub async fn change_priority(&mut self, priority: u32) -> BullmqResult<()> {
+        let ctx = self.ctx()?;
+        let mut conn = ctx.conn.clone();
+        let timestamp = now_ms();
+
+        crate::scripts::commands::change_priority::change_priority(
+            &ctx.scripts,
+            &mut conn,
+            &ctx.prefix,
+            &ctx.queue_name,
+            &self.id,
+            priority,
+            10_000,
+            timestamp,
+        )
+        .await?;
+
+        self.priority = priority;
+        self.opts.priority = if priority > 0 { Some(priority) } else { None };
+        Ok(())
+    }
+
+    /// Promote this job from delayed to wait (or prioritized if priority > 0).
+    pub async fn promote(&mut self) -> BullmqResult<()> {
+        let ctx = self.ctx()?;
+        let mut conn = ctx.conn.clone();
+        let timestamp = now_ms();
+
+        crate::scripts::commands::promote::promote(
+            &ctx.scripts,
+            &mut conn,
+            &ctx.prefix,
+            &ctx.queue_name,
+            &self.id,
+            10_000,
+            timestamp,
+        )
+        .await?;
+
+        self.state = JobState::Wait;
+        self.delay = 0;
+        Ok(())
+    }
+
     /// Retry this active job by moving it back to wait or prioritized.
     ///
     /// Only works on active jobs with a lock token (inside a worker handler).
