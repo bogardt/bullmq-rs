@@ -130,7 +130,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         let concurrency = self.options.concurrency;
 
         // Channel for fast-path: moveToFinished can return the next job.
-        let (next_job_tx, next_job_rx) = tokio::sync::mpsc::channel::<move_to_active::MoveToActiveResult>(1);
+        // Capacity matches concurrency so concurrent handler completions don't drop prefetched jobs.
+        let (next_job_tx, next_job_rx) = tokio::sync::mpsc::channel::<move_to_active::MoveToActiveResult>(concurrency);
         let next_job_rx = Arc::new(Mutex::new(next_job_rx));
 
         let join_handle = tokio::spawn({
@@ -518,7 +519,12 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             Ok(move_to_finished::MoveToFinishedResult::NextJob(next)) => {
                                                 // Fast-path: send next job via channel.
                                                 if next.job_id.is_some() {
-                                                    let _ = next_job_tx.try_send(next);
+                                                    if let Err(e) = next_job_tx.try_send(next) {
+                                                        tracing::warn!(
+                                                            "Fast-path channel full, prefetched job will be recovered via stalled check: {:?}",
+                                                            e.into_inner().job_id
+                                                        );
+                                                    }
                                                 }
                                             }
                                             Ok(move_to_finished::MoveToFinishedResult::Done) => {}
