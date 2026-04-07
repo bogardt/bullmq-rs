@@ -43,7 +43,6 @@ fn test_flow_job_public_shape() {
         let _job: Option<Job<serde_json::Value>> = None;
         Ok::<(), bullmq_rs::BullmqError>(())
     };
-
     assert_eq!(flow.children.len(), 1);
     assert_eq!(flow.queue_name, "parents");
 }
