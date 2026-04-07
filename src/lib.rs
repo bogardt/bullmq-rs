@@ -72,6 +72,6 @@ pub use connection::RedisConnection;
 pub use error::{BullmqError, BullmqResult};
 pub use job::Job;
 pub use queue::{Queue, QueueBuilder};
-pub use queue_events::QueueEvent;
+pub use queue_events::{QueueEvent, QueueEvents, QueueEventsBuilder};
 pub use types::{BackoffStrategy, JobOptions, JobState, WorkerOptions};
 pub use worker::{Worker, WorkerBuilder, WorkerHandle};
