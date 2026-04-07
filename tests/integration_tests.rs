@@ -808,15 +808,14 @@ async fn test_job_get_state_delayed() {
 #[tokio::test]
 #[ignore = "requires running Redis"]
 async fn test_concurrent_workers() {
+    let qname = unique_queue_name();
     let conn = redis_conn();
 
-    let queue = QueueBuilder::new("test_concurrent_v2")
+    let queue = QueueBuilder::new(&qname)
         .connection(conn.clone())
         .build::<TestJob>()
         .await
         .unwrap();
-
-    queue.drain().await.unwrap();
 
     // Add 10 jobs
     for i in 0..10 {
@@ -836,10 +835,11 @@ async fn test_concurrent_workers() {
 
     // Start worker 1
     let count1 = processed_count.clone();
-    let worker1 = WorkerBuilder::new("test_concurrent_v2")
+    let worker1 = WorkerBuilder::new(&qname)
         .connection(conn.clone())
         .concurrency(3)
-        .skip_stalled_check(true)
+        .lock_duration(Duration::from_secs(5))
+        .stalled_interval(Duration::from_secs(3))
         .build::<TestJob>();
 
     let handle1 = worker1
@@ -857,10 +857,11 @@ async fn test_concurrent_workers() {
 
     // Start worker 2
     let count2 = processed_count.clone();
-    let worker2 = WorkerBuilder::new("test_concurrent_v2")
+    let worker2 = WorkerBuilder::new(&qname)
         .connection(conn)
         .concurrency(3)
-        .skip_stalled_check(true)
+        .lock_duration(Duration::from_secs(5))
+        .stalled_interval(Duration::from_secs(3))
         .build::<TestJob>();
 
     let handle2 = worker2
@@ -876,8 +877,20 @@ async fn test_concurrent_workers() {
         .await
         .unwrap();
 
-    // Wait for all jobs to be processed
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    // Wait for all jobs to be processed. With two workers competing,
+    // stalled job recovery may be needed for the last job, so allow
+    // enough time for multiple stalled check cycles.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let c = *processed_count.lock().await;
+        if c >= 10 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("Timed out: only {}/10 jobs processed by concurrent workers", c);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     handle1.shutdown();
     handle2.shutdown();
