@@ -2,6 +2,30 @@ use bullmq_rs::*;
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[test]
+fn test_flow_job_public_shape() {
+    use bullmq_rs::{FlowJob, JobOptions};
+
+    let flow = FlowJob {
+        name: "parent".into(),
+        queue_name: "parents".into(),
+        data: serde_json::json!({"kind": "parent"}),
+        prefix: None,
+        opts: Some(JobOptions::default()),
+        children: vec![FlowJob {
+            name: "child".into(),
+            queue_name: "children".into(),
+            data: serde_json::json!({"kind": "child"}),
+            prefix: None,
+            opts: None,
+            children: vec![],
+        }],
+    };
+
+    assert_eq!(flow.children.len(), 1);
+    assert_eq!(flow.queue_name, "parents");
+}
+
 // ---------------------------------------------------------------------------
 // JobState tests
 // ---------------------------------------------------------------------------

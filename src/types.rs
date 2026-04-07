@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -145,6 +146,12 @@ impl Default for WorkerOptions {
             skip_stalled_check: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobDependencies {
+    pub processed: HashMap<String, serde_json::Value>,
+    pub unprocessed: Vec<String>,
 }
 
 /// Default maximum number of events to keep in the events stream.

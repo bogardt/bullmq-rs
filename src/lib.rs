@@ -58,6 +58,7 @@
 
 pub mod connection;
 pub mod error;
+pub mod flow_producer;
 pub mod types;
 
 pub mod job;
@@ -71,9 +72,10 @@ pub mod worker;
 
 pub use connection::RedisConnection;
 pub use error::{BullmqError, BullmqResult};
+pub use flow_producer::{FlowJob, FlowNode, FlowProducer, FlowProducerBuilder};
 pub use job::Job;
 pub use queue::{Queue, QueueBuilder};
 pub use queue_events::{QueueEvent, QueueEvents, QueueEventsBuilder};
 pub use queue_events_producer::{QueueEventsProducer, QueueEventsProducerBuilder};
-pub use types::{BackoffStrategy, JobOptions, JobState, WorkerOptions};
+pub use types::{BackoffStrategy, JobDependencies, JobOptions, JobState, WorkerOptions};
 pub use worker::{Worker, WorkerBuilder, WorkerHandle};
