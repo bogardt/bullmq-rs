@@ -21,7 +21,6 @@ fn test_flow_job_public_shape() {
             children: vec![],
         }],
     };
-
     let _shape_check = async {
         let producer: FlowProducer = FlowProducerBuilder::new()
             .prefix("custom")
