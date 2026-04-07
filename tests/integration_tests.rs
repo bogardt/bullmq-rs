@@ -893,3 +893,30 @@ async fn test_concurrent_workers() {
 
     queue.drain().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// 18. test_job_remove
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_remove() {
+    let conn = RedisConnection::new(
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
+    );
+    let queue = QueueBuilder::new(&unique_queue_name())
+        .connection(conn)
+        .build::<String>()
+        .await
+        .unwrap();
+
+    let job = queue.add("test", "data".to_string(), None).await.unwrap();
+    let job_id = job.id.clone();
+
+    job.remove().await.unwrap();
+
+    let fetched = queue.get_job(&job_id).await.unwrap();
+    assert!(fetched.is_none());
+
+    queue.drain().await.unwrap();
+}

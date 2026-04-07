@@ -481,4 +481,116 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
     pub async fn is_prioritized(&mut self) -> BullmqResult<bool> {
         Ok(self.get_state().await? == JobState::Prioritized)
     }
+
+    /// Remove this job from the queue.
+    ///
+    /// Removes the job ID from all state lists/sets and deletes the job hash,
+    /// lock key, and logs key. Not atomic (multiple Redis commands).
+    pub async fn remove(&self) -> BullmqResult<()> {
+        let ctx = self.ctx()?;
+        let mut conn = ctx.conn.clone();
+        let job_id = &self.id;
+
+        // Remove from lists (LREM)
+        for suffix in &["wait", "active", "paused"] {
+            let key = build_key(&ctx.prefix, &ctx.queue_name, suffix);
+            redis::cmd("LREM")
+                .arg(&key)
+                .arg(0i64)
+                .arg(job_id)
+                .query_async::<i64>(&mut conn)
+                .await?;
+        }
+
+        // Remove from sorted sets (ZREM)
+        for suffix in &["prioritized", "delayed", "completed", "failed"] {
+            let key = build_key(&ctx.prefix, &ctx.queue_name, suffix);
+            redis::cmd("ZREM")
+                .arg(&key)
+                .arg(job_id)
+                .query_async::<i64>(&mut conn)
+                .await?;
+        }
+
+        // Delete the job hash, lock key, and logs key
+        let job_key = self.queue_key(job_id)?;
+        let lock_key = format!("{}:lock", job_key);
+        let logs_key = format!("{}:logs", job_key);
+        redis::cmd("DEL")
+            .arg(&job_key)
+            .arg(&lock_key)
+            .arg(&logs_key)
+            .query_async::<i64>(&mut conn)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Move this active job back to delayed with a new delay.
+    ///
+    /// Only valid when the job is active and has a lock token (inside a worker handler).
+    pub async fn change_delay(&mut self, delay_ms: u64) -> BullmqResult<()> {
+        if self.state != JobState::Active {
+            return Err(BullmqError::Other(format!(
+                "change_delay requires job to be active, but job {} is in state {}",
+                self.id, self.state
+            )));
+        }
+
+        let token = self.lock_token.as_deref().ok_or_else(|| {
+            BullmqError::Other(
+                "change_delay requires a lock token (only available in worker handler)".into(),
+            )
+        })?;
+
+        let ctx = self.ctx()?;
+        let mut conn = ctx.conn.clone();
+        let timestamp = now_ms();
+        let delayed_timestamp = timestamp + delay_ms;
+
+        crate::scripts::commands::move_to_delayed::move_to_delayed(
+            &ctx.scripts,
+            &mut conn,
+            &ctx.prefix,
+            &ctx.queue_name,
+            &self.id,
+            token,
+            timestamp,
+            delayed_timestamp,
+            10_000,
+            self.attempts_made,
+        )
+        .await?;
+
+        self.delay = delay_ms;
+        Ok(())
+    }
+
+    /// Retry this active job by moving it back to wait or prioritized.
+    ///
+    /// Only works on active jobs with a lock token (inside a worker handler).
+    pub async fn retry(&self) -> BullmqResult<()> {
+        let token = self.lock_token.as_deref().ok_or_else(|| {
+            BullmqError::Other(
+                "retry requires a lock token (only available in worker handler)".into(),
+            )
+        })?;
+
+        let ctx = self.ctx()?;
+        let mut conn = ctx.conn.clone();
+
+        crate::scripts::commands::retry_job::retry_job(
+            &ctx.scripts,
+            &mut conn,
+            &ctx.prefix,
+            &ctx.queue_name,
+            &self.id,
+            token,
+            "RPUSH",
+            10_000,
+            self.attempts_made,
+            self.priority,
+        )
+        .await
+    }
 }
