@@ -18,10 +18,7 @@ type CompletedCallback = Arc<dyn Fn(&Job<serde_json::Value>) + Send + Sync>;
 type FailedCallback = Arc<dyn Fn(&Job<serde_json::Value>, &BullmqError) + Send + Sync>;
 use crate::scripts::commands::{extend_lock, move_stalled_jobs_to_wait, move_to_active, move_to_delayed, move_to_finished};
 use crate::scripts::ScriptLoader;
-use crate::types::WorkerOptions;
-
-/// Default maximum number of events to keep in the events stream.
-const DEFAULT_MAX_EVENTS: u64 = 10_000;
+use crate::types::{WorkerOptions, DEFAULT_MAX_EVENTS};
 
 /// A worker that processes jobs from a queue.
 ///

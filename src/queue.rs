@@ -14,10 +14,7 @@ use crate::scripts::commands::{
     add_delayed_job, add_log, add_prioritized_job, add_standard_job, pause,
 };
 use crate::scripts::ScriptLoader;
-use crate::types::{JobOptions, JobState};
-
-/// Default maximum number of events to keep in the events stream.
-const DEFAULT_MAX_EVENTS: u64 = 10_000;
+use crate::types::{JobOptions, JobState, DEFAULT_MAX_EVENTS};
 
 /// A typed job queue backed by Redis.
 ///

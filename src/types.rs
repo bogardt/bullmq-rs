@@ -147,6 +147,9 @@ impl Default for WorkerOptions {
     }
 }
 
+/// Default maximum number of events to keep in the events stream.
+pub(crate) const DEFAULT_MAX_EVENTS: u64 = 10_000;
+
 mod duration_millis {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
