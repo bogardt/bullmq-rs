@@ -58,12 +58,9 @@ impl QueueEventsProducer {
     /// Publish a custom event to the queue's event stream.
     ///
     /// Uses the default max stream length (10,000).
-    pub async fn publish(
-        &self,
-        event_name: &str,
-        fields: &[(&str, &str)],
-    ) -> BullmqResult<()> {
-        self.publish_with_max_len(event_name, fields, DEFAULT_MAX_EVENTS).await
+    pub async fn publish(&self, event_name: &str, fields: &[(&str, &str)]) -> BullmqResult<()> {
+        self.publish_with_max_len(event_name, fields, DEFAULT_MAX_EVENTS)
+            .await
     }
 
     /// Publish a custom event with a specific max stream length.

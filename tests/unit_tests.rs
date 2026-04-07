@@ -216,10 +216,7 @@ fn test_job_creation_with_options() {
     // Options are stored in the opts field
     assert_eq!(job.opts.attempts, Some(3));
     assert!(job.opts.backoff.is_some());
-    assert_eq!(
-        job.opts.ttl,
-        Some(Duration::from_secs(60))
-    );
+    assert_eq!(job.opts.ttl, Some(Duration::from_secs(60)));
 }
 
 #[test]
@@ -340,7 +337,12 @@ fn test_job_v2_roundtrip() {
         job_id: Some("custom-id".into()),
     };
 
-    let mut job = Job::new("custom-id".into(), "process".into(), json!({"key": "value"}), Some(opts));
+    let mut job = Job::new(
+        "custom-id".into(),
+        "process".into(),
+        json!({"key": "value"}),
+        Some(opts),
+    );
     job.attempts_made = 2;
     job.attempts_started = 3;
     job.processed_on = Some(1700000000000);
@@ -367,7 +369,10 @@ fn test_job_v2_roundtrip() {
     assert_eq!(restored.finished_on, Some(1700000001000));
     assert_eq!(restored.failed_reason, Some("network error".into()));
     assert_eq!(restored.return_value, Some(json!(42)));
-    assert_eq!(restored.stacktrace, vec!["Error: network error".to_string()]);
+    assert_eq!(
+        restored.stacktrace,
+        vec!["Error: network error".to_string()]
+    );
     assert_eq!(restored.processed_by, Some("worker-abc".into()));
     assert_eq!(restored.progress, Some(json!(75)));
 
@@ -417,6 +422,18 @@ fn test_job_v2_from_redis_hash_missing_optional_fields() {
     assert!(job.processed_by.is_none());
     // Default opts when none in hash
     assert!(job.opts.priority.is_none());
+}
+
+#[test]
+fn test_job_v2_from_redis_hash_plain_failed_reason() {
+    let mut map = HashMap::new();
+    map.insert("name".into(), "test".into());
+    map.insert("data".into(), "\"hello\"".into());
+    map.insert("timestamp".into(), "1700000000000".into());
+    map.insert("failedReason".into(), "plain failure".into());
+
+    let job = Job::<String>::from_redis_hash("1", &map).unwrap();
+    assert_eq!(job.failed_reason, Some("plain failure".to_string()));
 }
 
 // ---------------------------------------------------------------------------
@@ -501,10 +518,7 @@ fn test_error_display() {
 
 #[test]
 fn test_error_from_redis() {
-    let redis_err = redis::RedisError::from((
-        redis::ErrorKind::Io,
-        "connection refused",
-    ));
+    let redis_err = redis::RedisError::from((redis::ErrorKind::Io, "connection refused"));
     let err: BullmqError = redis_err.into();
     assert!(matches!(err, BullmqError::Redis(_)));
     assert!(err.to_string().contains("connection refused"));
@@ -522,10 +536,7 @@ fn test_error_new_variants() {
     assert_eq!(err.to_string(), "Queue is paused");
 
     let err = BullmqError::ScriptError("NOSCRIPT No matching script".into());
-    assert_eq!(
-        err.to_string(),
-        "Script error: NOSCRIPT No matching script"
-    );
+    assert_eq!(err.to_string(), "Script error: NOSCRIPT No matching script");
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +553,10 @@ fn test_parse_event_completed() {
 
     let event = bullmq_rs::QueueEvent::parse(&fields);
     match event {
-        bullmq_rs::QueueEvent::Completed { job_id, return_value } => {
+        bullmq_rs::QueueEvent::Completed {
+            job_id,
+            return_value,
+        } => {
             assert_eq!(job_id, "42");
             assert_eq!(return_value, serde_json::json!({"result": "ok"}));
         }
@@ -588,21 +602,30 @@ fn test_parse_event_waiting_with_empty_prev() {
 fn test_parse_event_paused() {
     let mut fields = std::collections::HashMap::new();
     fields.insert("event".into(), "paused".into());
-    assert_eq!(bullmq_rs::QueueEvent::parse(&fields), bullmq_rs::QueueEvent::Paused);
+    assert_eq!(
+        bullmq_rs::QueueEvent::parse(&fields),
+        bullmq_rs::QueueEvent::Paused
+    );
 }
 
 #[test]
 fn test_parse_event_resumed() {
     let mut fields = std::collections::HashMap::new();
     fields.insert("event".into(), "resumed".into());
-    assert_eq!(bullmq_rs::QueueEvent::parse(&fields), bullmq_rs::QueueEvent::Resumed);
+    assert_eq!(
+        bullmq_rs::QueueEvent::parse(&fields),
+        bullmq_rs::QueueEvent::Resumed
+    );
 }
 
 #[test]
 fn test_parse_event_drained() {
     let mut fields = std::collections::HashMap::new();
     fields.insert("event".into(), "drained".into());
-    assert_eq!(bullmq_rs::QueueEvent::parse(&fields), bullmq_rs::QueueEvent::Drained);
+    assert_eq!(
+        bullmq_rs::QueueEvent::parse(&fields),
+        bullmq_rs::QueueEvent::Drained
+    );
 }
 
 #[test]

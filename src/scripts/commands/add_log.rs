@@ -20,10 +20,7 @@ pub(crate) async fn add_log(
     let job_key = format!("{}:{}:{}", prefix, queue_name, job_id);
     let logs_key = format!("{}:logs", job_key);
 
-    let keys = vec![
-        logs_key,
-        key(prefix, queue_name, "meta"),
-    ];
+    let keys = vec![logs_key, key(prefix, queue_name, "meta")];
     let args: Vec<Vec<u8>> = vec![
         log_line.as_bytes().to_vec(),
         max_log_count.to_string().into_bytes(),

@@ -93,9 +93,10 @@ impl ScriptLoader {
         keys: &[String],
         args: &[Vec<u8>],
     ) -> BullmqResult<redis::Value> {
-        let script = self.scripts.get(name).ok_or_else(|| {
-            BullmqError::ScriptError(format!("Unknown script: {}", name))
-        })?;
+        let script = self
+            .scripts
+            .get(name)
+            .ok_or_else(|| BullmqError::ScriptError(format!("Unknown script: {}", name)))?;
         let mut invocation = script.prepare_invoke();
         for key in keys {
             invocation.key(key);
@@ -115,9 +116,7 @@ mod tests {
     #[test]
     fn test_resolve_includes() {
         let main = "local foo = 1\n--@include \"helper\"\nlocal bar = 2";
-        let includes = HashMap::from([
-            ("helper".to_string(), "local helper_val = 42".to_string()),
-        ]);
+        let includes = HashMap::from([("helper".to_string(), "local helper_val = 42".to_string())]);
         let resolved = resolve_includes(main, &includes);
         assert!(resolved.contains("local helper_val = 42"));
         assert!(resolved.contains("local foo = 1"));

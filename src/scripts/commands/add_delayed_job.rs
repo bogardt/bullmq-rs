@@ -39,9 +39,7 @@ pub(crate) async fn add_delayed_job(
         max_events.to_string().into_bytes(),
         delayed_timestamp.to_string().into_bytes(),
     ];
-    let result = loader
-        .invoke("addDelayedJob", conn, &keys, &args)
-        .await?;
+    let result = loader.invoke("addDelayedJob", conn, &keys, &args).await?;
     match result {
         redis::Value::BulkString(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
         redis::Value::SimpleString(s) => Ok(s),

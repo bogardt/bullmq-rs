@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -55,6 +55,91 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             prefix: self.prefix.clone(),
             queue_name: self.name.clone(),
         })
+    }
+
+    fn normalize_job_states(states: &[JobState]) -> Vec<JobState> {
+        let requested = if states.is_empty() {
+            vec![
+                JobState::Wait,
+                JobState::Active,
+                JobState::Delayed,
+                JobState::Prioritized,
+                JobState::Completed,
+                JobState::Failed,
+                JobState::WaitingChildren,
+            ]
+        } else {
+            states.to_vec()
+        };
+
+        let mut normalized = Vec::new();
+        let mut seen = HashSet::new();
+
+        for state in requested {
+            if seen.insert(state) {
+                normalized.push(state);
+            }
+
+            if state == JobState::Wait && seen.insert(JobState::Paused) {
+                normalized.push(JobState::Paused);
+            }
+        }
+
+        normalized
+    }
+
+    async fn get_job_ids(
+        &self,
+        state: JobState,
+        start: i64,
+        end: i64,
+        asc: bool,
+    ) -> BullmqResult<Vec<String>> {
+        let mut conn = self.conn.clone();
+
+        match state {
+            JobState::Wait | JobState::Active | JobState::Paused => {
+                let mut ids: Vec<String> = if asc {
+                    let modified_start = if start == -1 { 0 } else { -(start + 1) };
+                    let modified_end = if end == -1 { 0 } else { -(end + 1) };
+
+                    redis::cmd("LRANGE")
+                        .arg(self.key(&state.to_string()))
+                        .arg(modified_end)
+                        .arg(modified_start)
+                        .query_async(&mut conn)
+                        .await?
+                } else {
+                    redis::cmd("LRANGE")
+                        .arg(self.key(&state.to_string()))
+                        .arg(start)
+                        .arg(end)
+                        .query_async(&mut conn)
+                        .await?
+                };
+
+                if asc {
+                    ids.reverse();
+                }
+
+                Ok(ids)
+            }
+            JobState::Prioritized
+            | JobState::WaitingChildren
+            | JobState::Delayed
+            | JobState::Completed
+            | JobState::Failed => {
+                let command = if asc { "ZRANGE" } else { "ZREVRANGE" };
+                let ids: Vec<String> = redis::cmd(command)
+                    .arg(self.key(&state.to_string()))
+                    .arg(start)
+                    .arg(end)
+                    .query_async(&mut conn)
+                    .await?;
+
+                Ok(ids)
+            }
+        }
     }
 
     /// Add a job to the queue.
@@ -216,6 +301,139 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
         counts.insert(JobState::WaitingChildren, waiting_children);
 
         Ok(counts)
+    }
+
+    /// Total jobs waiting to be processed.
+    ///
+    /// Matches BullMQ Node.js `Queue.count()` by including wait, paused,
+    /// delayed, prioritized, and waiting-children.
+    pub async fn count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+
+        Ok(counts.get(&JobState::Wait).copied().unwrap_or(0)
+            + counts.get(&JobState::Paused).copied().unwrap_or(0)
+            + counts.get(&JobState::Delayed).copied().unwrap_or(0)
+            + counts.get(&JobState::Prioritized).copied().unwrap_or(0)
+            + counts.get(&JobState::WaitingChildren).copied().unwrap_or(0))
+    }
+
+    /// Number of jobs in the waiting state, including paused jobs.
+    pub async fn get_waiting_count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+
+        Ok(counts.get(&JobState::Wait).copied().unwrap_or(0)
+            + counts.get(&JobState::Paused).copied().unwrap_or(0))
+    }
+
+    /// Number of jobs in the active state.
+    pub async fn get_active_count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+        Ok(counts.get(&JobState::Active).copied().unwrap_or(0))
+    }
+
+    /// Number of jobs in the delayed state.
+    pub async fn get_delayed_count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+        Ok(counts.get(&JobState::Delayed).copied().unwrap_or(0))
+    }
+
+    /// Number of jobs in the completed state.
+    pub async fn get_completed_count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+        Ok(counts.get(&JobState::Completed).copied().unwrap_or(0))
+    }
+
+    /// Number of jobs in the failed state.
+    pub async fn get_failed_count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+        Ok(counts.get(&JobState::Failed).copied().unwrap_or(0))
+    }
+
+    /// Number of jobs in the prioritized state.
+    pub async fn get_prioritized_count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+        Ok(counts.get(&JobState::Prioritized).copied().unwrap_or(0))
+    }
+
+    /// Number of jobs in the waiting-children state.
+    pub async fn get_waiting_children_count(&self) -> BullmqResult<u64> {
+        let counts = self.get_job_counts().await?;
+        Ok(counts.get(&JobState::WaitingChildren).copied().unwrap_or(0))
+    }
+
+    /// Get jobs from one or more states with BullMQ-compatible ordering.
+    pub async fn get_jobs(
+        &self,
+        states: &[JobState],
+        start: i64,
+        end: i64,
+        asc: bool,
+    ) -> BullmqResult<Vec<Job<T>>> {
+        let query_states = Self::normalize_job_states(states);
+        let mut conn = self.conn.clone();
+        let ctx = self.job_context();
+        let mut seen = HashSet::new();
+        let mut jobs = Vec::new();
+
+        for state in query_states {
+            let job_ids = self.get_job_ids(state, start, end, asc).await?;
+
+            for job_id in job_ids {
+                if !seen.insert(job_id.clone()) {
+                    continue;
+                }
+
+                let map: HashMap<String, String> = conn.hgetall(self.key(&job_id)).await?;
+                if map.is_empty() {
+                    continue;
+                }
+
+                let mut job = Job::from_redis_hash(&job_id, &map)?;
+                job.state = state;
+                job.ctx = Some(ctx.clone());
+                jobs.push(job);
+            }
+        }
+
+        Ok(jobs)
+    }
+
+    /// Get waiting jobs, including paused jobs, oldest first.
+    pub async fn get_waiting(&self, start: i64, end: i64) -> BullmqResult<Vec<Job<T>>> {
+        self.get_jobs(&[JobState::Wait], start, end, true).await
+    }
+
+    /// Get active jobs, oldest first.
+    pub async fn get_active(&self, start: i64, end: i64) -> BullmqResult<Vec<Job<T>>> {
+        self.get_jobs(&[JobState::Active], start, end, true).await
+    }
+
+    /// Get delayed jobs, earliest scheduled first.
+    pub async fn get_delayed(&self, start: i64, end: i64) -> BullmqResult<Vec<Job<T>>> {
+        self.get_jobs(&[JobState::Delayed], start, end, true).await
+    }
+
+    /// Get prioritized jobs, highest priority first.
+    pub async fn get_prioritized(&self, start: i64, end: i64) -> BullmqResult<Vec<Job<T>>> {
+        self.get_jobs(&[JobState::Prioritized], start, end, true)
+            .await
+    }
+
+    /// Get completed jobs, newest first.
+    pub async fn get_completed(&self, start: i64, end: i64) -> BullmqResult<Vec<Job<T>>> {
+        self.get_jobs(&[JobState::Completed], start, end, false)
+            .await
+    }
+
+    /// Get failed jobs, newest first.
+    pub async fn get_failed(&self, start: i64, end: i64) -> BullmqResult<Vec<Job<T>>> {
+        self.get_jobs(&[JobState::Failed], start, end, false).await
+    }
+
+    /// Get waiting-children jobs, lowest score first.
+    pub async fn get_waiting_children(&self, start: i64, end: i64) -> BullmqResult<Vec<Job<T>>> {
+        self.get_jobs(&[JobState::WaitingChildren], start, end, true)
+            .await
     }
 
     /// Remove a job by its ID from all state lists/sets and delete its hash,

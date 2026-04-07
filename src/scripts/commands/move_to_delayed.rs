@@ -41,9 +41,7 @@ pub(crate) async fn move_to_delayed(
         attempts_made.to_string().into_bytes(),
     ];
 
-    let result = loader
-        .invoke("moveToDelayed", conn, &keys, &args)
-        .await?;
+    let result = loader.invoke("moveToDelayed", conn, &keys, &args).await?;
 
     match result {
         redis::Value::Int(code) => {

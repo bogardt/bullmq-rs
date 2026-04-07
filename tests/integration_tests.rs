@@ -150,6 +150,320 @@ async fn test_queue_job_counts() {
 }
 
 // ---------------------------------------------------------------------------
+// 3. test_queue_count_methods
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_count_methods() {
+    let qname = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        queue
+            .add(
+                "std",
+                TestJob {
+                    value: format!("s{}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let delayed_opts = JobOptions {
+        delay: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    };
+    queue
+        .add(
+            "delayed",
+            TestJob { value: "d0".into() },
+            Some(delayed_opts),
+        )
+        .await
+        .unwrap();
+
+    let prio_opts = JobOptions {
+        priority: Some(5),
+        ..Default::default()
+    };
+    queue
+        .add("prio", TestJob { value: "p0".into() }, Some(prio_opts))
+        .await
+        .unwrap();
+
+    let total = queue.count().await.unwrap();
+    assert_eq!(total, 5);
+    assert_eq!(queue.get_waiting_count().await.unwrap(), 3);
+    assert_eq!(queue.get_active_count().await.unwrap(), 0);
+    assert_eq!(queue.get_delayed_count().await.unwrap(), 1);
+    assert_eq!(queue.get_prioritized_count().await.unwrap(), 1);
+    assert_eq!(queue.get_completed_count().await.unwrap(), 0);
+    assert_eq!(queue.get_failed_count().await.unwrap(), 0);
+    assert_eq!(queue.get_waiting_children_count().await.unwrap(), 0);
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 4. test_queue_get_jobs
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_get_jobs() {
+    let qname = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        queue
+            .add(
+                "std",
+                TestJob {
+                    value: format!("job-{}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let delayed_opts = JobOptions {
+        delay: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    };
+    queue
+        .add(
+            "delayed",
+            TestJob {
+                value: "delayed-0".into(),
+            },
+            Some(delayed_opts),
+        )
+        .await
+        .unwrap();
+
+    let waiting = queue
+        .get_jobs(&[JobState::Wait], 0, -1, true)
+        .await
+        .unwrap();
+    assert_eq!(waiting.len(), 3);
+
+    let mixed = queue
+        .get_jobs(&[JobState::Wait, JobState::Delayed], 0, -1, true)
+        .await
+        .unwrap();
+    assert_eq!(mixed.len(), 4);
+
+    let page = queue.get_jobs(&[JobState::Wait], 0, 1, true).await.unwrap();
+    assert_eq!(page.len(), 2);
+
+    let mut first = waiting.into_iter().next().unwrap();
+    let state = first.get_state().await.unwrap();
+    assert_eq!(state, JobState::Wait);
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 5. test_queue_convenience_getters
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_convenience_getters() {
+    let qname = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        queue
+            .add(
+                "std",
+                TestJob {
+                    value: format!("w{}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let delayed_opts = JobOptions {
+        delay: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    };
+    queue
+        .add(
+            "delayed",
+            TestJob { value: "d0".into() },
+            Some(delayed_opts),
+        )
+        .await
+        .unwrap();
+
+    let prio_opts = JobOptions {
+        priority: Some(5),
+        ..Default::default()
+    };
+    queue
+        .add("prio", TestJob { value: "p0".into() }, Some(prio_opts))
+        .await
+        .unwrap();
+
+    let waiting = queue.get_waiting(0, -1).await.unwrap();
+    assert_eq!(waiting.len(), 3);
+    assert!(waiting[0].timestamp <= waiting[1].timestamp);
+    assert!(waiting[1].timestamp <= waiting[2].timestamp);
+
+    let delayed = queue.get_delayed(0, -1).await.unwrap();
+    assert_eq!(delayed.len(), 1);
+
+    let prioritized = queue.get_prioritized(0, -1).await.unwrap();
+    assert_eq!(prioritized.len(), 1);
+
+    let active = queue.get_active(0, -1).await.unwrap();
+    assert_eq!(active.len(), 0);
+
+    let completed = queue.get_completed(0, -1).await.unwrap();
+    assert_eq!(completed.len(), 0);
+
+    let failed = queue.get_failed(0, -1).await.unwrap();
+    assert_eq!(failed.len(), 0);
+
+    let waiting_children = queue.get_waiting_children(0, -1).await.unwrap();
+    assert_eq!(waiting_children.len(), 0);
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 6. test_queue_get_waiting_includes_paused
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_get_waiting_includes_paused() {
+    let qname = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add("before_pause", TestJob { value: "a".into() }, None)
+        .await
+        .unwrap();
+
+    queue.pause().await.unwrap();
+
+    queue
+        .add("after_pause", TestJob { value: "b".into() }, None)
+        .await
+        .unwrap();
+
+    let waiting = queue.get_waiting(0, -1).await.unwrap();
+    assert_eq!(waiting.len(), 2);
+
+    queue.resume().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 7. test_queue_get_completed_and_failed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_get_completed_and_failed() {
+    let qname = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<String>()
+        .await
+        .unwrap();
+
+    queue.add("ok", "success".to_string(), None).await.unwrap();
+    queue
+        .add("fail", "will_fail".to_string(), None)
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn.clone())
+        .concurrency(1)
+        .skip_stalled_check(true)
+        .build::<String>();
+
+    let processed = Arc::new(Mutex::new(0u32));
+    let processed_clone = processed.clone();
+
+    let handle = worker
+        .start(move |job| {
+            let processed = processed_clone.clone();
+            async move {
+                let mut p = processed.lock().await;
+                *p += 1;
+                if job.data == "will_fail" {
+                    Err("intentional failure".into())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if *processed.lock().await >= 2 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("Timed out waiting for jobs to process");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    let completed = queue.get_completed(0, -1).await.unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].data, "success");
+
+    let failed = queue.get_failed(0, -1).await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].data, "will_fail");
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // 3. test_queue_remove_job
 // ---------------------------------------------------------------------------
 

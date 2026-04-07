@@ -30,7 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,
         )
         .await?;
-    println!("Added job: {} (id: {}, state: {})", job.name, job.id, job.state);
+    println!(
+        "Added job: {} (id: {}, state: {})",
+        job.name, job.id, job.state
+    );
 
     // Add a delayed job (30 second delay)
     let delayed_job = queue
@@ -99,12 +102,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get job counts
     let counts = queue.get_job_counts().await?;
     println!("\nJob counts:");
-    println!("  Wait:        {}", counts.get(&JobState::Wait).unwrap_or(&0));
-    println!("  Prioritized: {}", counts.get(&JobState::Prioritized).unwrap_or(&0));
-    println!("  Delayed:     {}", counts.get(&JobState::Delayed).unwrap_or(&0));
-    println!("  Active:      {}", counts.get(&JobState::Active).unwrap_or(&0));
-    println!("  Completed:   {}", counts.get(&JobState::Completed).unwrap_or(&0));
-    println!("  Failed:      {}", counts.get(&JobState::Failed).unwrap_or(&0));
+    println!(
+        "  Wait:        {}",
+        counts.get(&JobState::Wait).unwrap_or(&0)
+    );
+    println!(
+        "  Prioritized: {}",
+        counts.get(&JobState::Prioritized).unwrap_or(&0)
+    );
+    println!(
+        "  Delayed:     {}",
+        counts.get(&JobState::Delayed).unwrap_or(&0)
+    );
+    println!(
+        "  Active:      {}",
+        counts.get(&JobState::Active).unwrap_or(&0)
+    );
+    println!(
+        "  Completed:   {}",
+        counts.get(&JobState::Completed).unwrap_or(&0)
+    );
+    println!(
+        "  Failed:      {}",
+        counts.get(&JobState::Failed).unwrap_or(&0)
+    );
 
     Ok(())
 }

@@ -56,18 +56,19 @@ pub(crate) async fn move_to_active(
 }
 
 /// Parse the Lua return value into a `MoveToActiveResult`.
-pub(crate) fn parse_move_to_active_result(
-    value: redis::Value,
-) -> BullmqResult<MoveToActiveResult> {
+pub(crate) fn parse_move_to_active_result(value: redis::Value) -> BullmqResult<MoveToActiveResult> {
     match value {
         redis::Value::Array(items) if !items.is_empty() => {
             // First element is the job ID
             let job_id = match &items[0] {
-                redis::Value::BulkString(bytes) => {
-                    String::from_utf8_lossy(bytes).to_string()
-                }
+                redis::Value::BulkString(bytes) => String::from_utf8_lossy(bytes).to_string(),
                 redis::Value::SimpleString(s) => s.clone(),
-                _ => return Ok(MoveToActiveResult { job_id: None, job_data: HashMap::new() }),
+                _ => {
+                    return Ok(MoveToActiveResult {
+                        job_id: None,
+                        job_data: HashMap::new(),
+                    })
+                }
             };
 
             // Remaining elements are key-value pairs from HGETALL
@@ -77,7 +78,10 @@ pub(crate) fn parse_move_to_active_result(
                 let k = match &items[i] {
                     redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),
                     redis::Value::SimpleString(s) => s.clone(),
-                    _ => { i += 2; continue; }
+                    _ => {
+                        i += 2;
+                        continue;
+                    }
                 };
                 let v = match &items[i + 1] {
                     redis::Value::BulkString(b) => String::from_utf8_lossy(b).to_string(),

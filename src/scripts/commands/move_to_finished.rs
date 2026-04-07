@@ -61,16 +61,18 @@ pub(crate) async fn move_to_finished(
         result_data.as_bytes().to_vec(),
         target_state.as_bytes().to_vec(),
         max_events.to_string().into_bytes(),
-        if fetch_next { b"1".to_vec() } else { b"0".to_vec() },
+        if fetch_next {
+            b"1".to_vec()
+        } else {
+            b"0".to_vec()
+        },
         lock_duration.to_string().into_bytes(),
         job_id.as_bytes().to_vec(),
         attempts_made.to_string().into_bytes(),
         job_key_prefix.into_bytes(),
     ];
 
-    let result = loader
-        .invoke("moveToFinished", conn, &keys, &args)
-        .await?;
+    let result = loader.invoke("moveToFinished", conn, &keys, &args).await?;
 
     match &result {
         redis::Value::Int(code) => {

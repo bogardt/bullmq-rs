@@ -20,10 +20,7 @@ pub(crate) async fn extend_lock(
     let job_key = format!("{}:{}:{}", prefix, queue_name, job_id);
     let lock_key = format!("{}:lock", job_key);
 
-    let keys = vec![
-        lock_key,
-        key(prefix, queue_name, "stalled"),
-    ];
+    let keys = vec![lock_key, key(prefix, queue_name, "stalled")];
     let args: Vec<Vec<u8>> = vec![
         token.as_bytes().to_vec(),
         lock_duration.to_string().into_bytes(),

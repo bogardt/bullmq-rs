@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{BullmqError, BullmqResult};
 use crate::queue_events::{QueueEvent, QueueEvents};
-use crate::scripts::ScriptLoader;
 use crate::scripts::commands::key as build_key;
+use crate::scripts::ScriptLoader;
 use crate::types::{JobOptions, JobState};
 
 /// Returns the current time as milliseconds since the Unix epoch.
@@ -162,7 +162,10 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             fields.push(("returnvalue".into(), serde_json::to_string(val)?));
         }
         if !self.stacktrace.is_empty() {
-            fields.push(("stacktrace".into(), serde_json::to_string(&self.stacktrace)?));
+            fields.push((
+                "stacktrace".into(),
+                serde_json::to_string(&self.stacktrace)?,
+            ));
         }
         if let Some(ref pb) = self.processed_by {
             fields.push(("pb".into(), pb.clone()));
@@ -177,9 +180,8 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
     /// (e.g., `stc` for stalled counter, managed by Lua scripts).
     pub fn from_redis_hash(id: &str, map: &HashMap<String, String>) -> BullmqResult<Self> {
         let get = |key: &str| -> BullmqResult<&String> {
-            map.get(key).ok_or_else(|| {
-                BullmqError::Other(format!("Missing field '{}' in job hash", key))
-            })
+            map.get(key)
+                .ok_or_else(|| BullmqError::Other(format!("Missing field '{}' in job hash", key)))
         };
 
         let data: T = serde_json::from_str(get("data")?)?;
@@ -231,10 +233,9 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             .map(|s| s.parse::<u64>())
             .transpose()
             .map_err(|_| BullmqError::Other("Invalid finishedOn".into()))?;
-        let failed_reason = map
-            .get("failedReason")
-            .map(|s| serde_json::from_str(s))
-            .transpose()?;
+        let failed_reason = map.get("failedReason").map(|s| {
+            serde_json::from_str(s).unwrap_or_else(|_| s.clone())
+        });
         let return_value = map
             .get("returnvalue")
             .map(|s| serde_json::from_str(s))
@@ -600,7 +601,11 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
 
         self.priority = priority;
         self.opts.priority = if priority > 0 { Some(priority) } else { None };
-        self.state = if priority > 0 { JobState::Prioritized } else { JobState::Wait };
+        self.state = if priority > 0 {
+            JobState::Prioritized
+        } else {
+            JobState::Wait
+        };
         Ok(())
     }
 
@@ -673,7 +678,10 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
         let mut rx = queue_events.subscribe();
 
         // 2. Race condition guard: check if already finished.
-        if let Some(result) = self.check_finished(&mut conn, &ctx.prefix, &ctx.queue_name, &job_id).await? {
+        if let Some(result) = self
+            .check_finished(&mut conn, &ctx.prefix, &ctx.queue_name, &job_id)
+            .await?
+        {
             return result;
         }
 
@@ -681,16 +689,31 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
         let wait_fut = async {
             loop {
                 match rx.recv().await {
-                    Ok((QueueEvent::Completed { job_id: eid, return_value }, _)) if eid == job_id => {
+                    Ok((
+                        QueueEvent::Completed {
+                            job_id: eid,
+                            return_value,
+                        },
+                        _,
+                    )) if eid == job_id => {
                         return Ok(return_value);
                     }
-                    Ok((QueueEvent::Failed { job_id: eid, reason }, _)) if eid == job_id => {
+                    Ok((
+                        QueueEvent::Failed {
+                            job_id: eid,
+                            reason,
+                        },
+                        _,
+                    )) if eid == job_id => {
                         return Err(BullmqError::Other(reason));
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         // Missed events — fall back to Redis check.
-                        if let Some(result) = self.check_finished(&mut conn, &ctx.prefix, &ctx.queue_name, &job_id).await? {
+                        if let Some(result) = self
+                            .check_finished(&mut conn, &ctx.prefix, &ctx.queue_name, &job_id)
+                            .await?
+                        {
                             return result;
                         }
                         continue;
@@ -703,11 +726,9 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
         };
 
         match ttl {
-            Some(duration) => {
-                tokio::time::timeout(duration, wait_fut)
-                    .await
-                    .unwrap_or(Err(BullmqError::Other("Job wait timed out".into())))
-            }
+            Some(duration) => tokio::time::timeout(duration, wait_fut)
+                .await
+                .unwrap_or(Err(BullmqError::Other("Job wait timed out".into()))),
             None => wait_fut.await,
         }
     }
