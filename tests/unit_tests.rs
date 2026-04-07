@@ -22,13 +22,26 @@ fn test_flow_job_public_shape() {
         }],
     };
 
-    let _builder = FlowProducerBuilder::new().prefix("custom");
-    let _producer: Option<FlowProducer> = None;
-    let _node: Option<FlowNode<serde_json::Value>> = None;
-    let _job: Option<Job<serde_json::Value>> = None;
-    let _deps = JobDependencies {
-        processed: std::collections::HashMap::new(),
-        unprocessed: vec![],
+    let _shape_check = async {
+        let producer: FlowProducer = FlowProducerBuilder::new()
+            .prefix("custom")
+            .build()
+            .await?;
+        let job = FlowJob {
+            name: "child".into(),
+            queue_name: "children".into(),
+            data: serde_json::json!({"kind": "child"}),
+            prefix: None,
+            opts: None,
+            children: vec![],
+        };
+        let _node: FlowNode<serde_json::Value> = producer.add(job).await?;
+        let _deps = JobDependencies {
+            processed: std::collections::HashMap::new(),
+            unprocessed: vec![],
+        };
+        let _job: Option<Job<serde_json::Value>> = None;
+        Ok::<(), bullmq_rs::BullmqError>(())
     };
 
     assert_eq!(flow.children.len(), 1);

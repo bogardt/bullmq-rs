@@ -5,6 +5,8 @@ use crate::error::{BullmqError, BullmqResult};
 use crate::job::Job;
 use crate::scripts::ScriptLoader;
 use crate::types::JobOptions;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 /// Producer for BullMQ flows.
 pub struct FlowProducer {
@@ -60,6 +62,7 @@ impl FlowProducerBuilder {
 
     /// Build the flow producer.
     pub async fn build(self) -> BullmqResult<FlowProducer> {
+        let _conn = self.connection.get_manager().await?;
         Ok(FlowProducer {
             connection: self.connection,
             prefix: self.prefix,
@@ -70,7 +73,10 @@ impl FlowProducerBuilder {
 
 impl FlowProducer {
     /// Add a flow to Redis.
-    pub async fn add<T>(&self, _job: FlowJob<T>) -> BullmqResult<FlowNode<T>> {
+    pub async fn add<T>(&self, _job: FlowJob<T>) -> BullmqResult<FlowNode<T>>
+    where
+        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+    {
         let _ = (&self.connection, &self.prefix, &self.scripts);
         Err(BullmqError::NotImplemented(
             "FlowProducer::add is not yet implemented".into(),
