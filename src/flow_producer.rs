@@ -143,7 +143,6 @@ impl FlowProducer {
 
         let exec_result: redis::Value = redis::cmd("EXEC").query_async(&mut conn).await?;
         validate_exec_result(exec_result)?;
-
         Ok(build_flow_node(
             prepared,
             conn.clone(),
@@ -412,7 +411,6 @@ async fn maybe_watch_window_hook(
 ) -> BullmqResult<()> {
     Ok(())
 }
-
 fn queue_insert<'a, T>(
     scripts: &'a ScriptLoader,
     conn: &'a mut redis::aio::ConnectionManager,
