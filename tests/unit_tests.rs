@@ -4,7 +4,7 @@ use std::time::Duration;
 
 #[test]
 fn test_flow_job_public_shape() {
-    use bullmq_rs::{FlowJob, JobOptions};
+    use bullmq_rs::{FlowJob, FlowNode, FlowProducer, FlowProducerBuilder, Job, JobDependencies, JobOptions};
 
     let flow = FlowJob {
         name: "parent".into(),
@@ -20,6 +20,15 @@ fn test_flow_job_public_shape() {
             opts: None,
             children: vec![],
         }],
+    };
+
+    let _builder = FlowProducerBuilder::new().prefix("custom");
+    let _producer: Option<FlowProducer> = None;
+    let _node: Option<FlowNode<serde_json::Value>> = None;
+    let _job: Option<Job<serde_json::Value>> = None;
+    let _deps = JobDependencies {
+        processed: std::collections::HashMap::new(),
+        unprocessed: vec![],
     };
 
     assert_eq!(flow.children.len(), 1);

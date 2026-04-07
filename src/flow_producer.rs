@@ -15,7 +15,7 @@ pub struct FlowProducer {
 
 /// Builder for creating a [`FlowProducer`].
 pub struct FlowProducerBuilder {
-    connection: Option<RedisConnection>,
+    connection: RedisConnection,
     prefix: String,
 }
 
@@ -41,14 +41,14 @@ impl FlowProducerBuilder {
     /// Create a new flow producer builder.
     pub fn new() -> Self {
         Self {
-            connection: None,
+            connection: RedisConnection::default(),
             prefix: "bull".to_string(),
         }
     }
 
     /// Set the Redis connection configuration.
     pub fn connection(mut self, conn: RedisConnection) -> Self {
-        self.connection = Some(conn);
+        self.connection = conn;
         self
     }
 
@@ -60,12 +60,8 @@ impl FlowProducerBuilder {
 
     /// Build the flow producer.
     pub async fn build(self) -> BullmqResult<FlowProducer> {
-        let connection = self.connection.ok_or_else(|| {
-            BullmqError::Other("FlowProducerBuilder requires a Redis connection".into())
-        })?;
-
         Ok(FlowProducer {
-            connection,
+            connection: self.connection,
             prefix: self.prefix,
             scripts: Arc::new(ScriptLoader::new()),
         })
