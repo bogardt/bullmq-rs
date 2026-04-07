@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::connection::RedisConnection;
 use crate::error::{BullmqError, BullmqResult};
-use crate::job::{Job, JobContext};
+use crate::job::{cleanup_job, Job, JobContext};
 use crate::scripts::commands::{
     add_delayed_job, add_log, add_prioritized_job, add_standard_job, pause,
 };
@@ -440,61 +440,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
     /// lock key, and logs key.
     pub async fn remove(&self, job_id: &str) -> BullmqResult<()> {
         let mut conn = self.conn.clone();
-
-        // Remove from lists (LREM)
-        redis::cmd("LREM")
-            .arg(self.key("wait"))
-            .arg(0i64)
-            .arg(job_id)
-            .query_async::<i64>(&mut conn)
-            .await?;
-        redis::cmd("LREM")
-            .arg(self.key("active"))
-            .arg(0i64)
-            .arg(job_id)
-            .query_async::<i64>(&mut conn)
-            .await?;
-        redis::cmd("LREM")
-            .arg(self.key("paused"))
-            .arg(0i64)
-            .arg(job_id)
-            .query_async::<i64>(&mut conn)
-            .await?;
-
-        // Remove from sorted sets (ZREM)
-        redis::cmd("ZREM")
-            .arg(self.key("prioritized"))
-            .arg(job_id)
-            .query_async::<i64>(&mut conn)
-            .await?;
-        redis::cmd("ZREM")
-            .arg(self.key("delayed"))
-            .arg(job_id)
-            .query_async::<i64>(&mut conn)
-            .await?;
-        redis::cmd("ZREM")
-            .arg(self.key("completed"))
-            .arg(job_id)
-            .query_async::<i64>(&mut conn)
-            .await?;
-        redis::cmd("ZREM")
-            .arg(self.key("failed"))
-            .arg(job_id)
-            .query_async::<i64>(&mut conn)
-            .await?;
-
-        // Delete the job hash, lock key, and logs key
-        let job_key = self.key(job_id);
-        let lock_key = format!("{}:lock", job_key);
-        let logs_key = format!("{}:logs", job_key);
-        redis::cmd("DEL")
-            .arg(&job_key)
-            .arg(&lock_key)
-            .arg(&logs_key)
-            .query_async::<i64>(&mut conn)
-            .await?;
-
-        Ok(())
+        cleanup_job(&mut conn, &self.prefix, &self.name, job_id).await
     }
 
     /// Remove all jobs from the queue (drain).
@@ -549,9 +495,15 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             .arg(-1i64)
             .query_async(&mut conn)
             .await?;
+        let waiting_children: Vec<String> = redis::cmd("ZRANGE")
+            .arg(self.key("waiting-children"))
+            .arg(0i64)
+            .arg(-1i64)
+            .query_async(&mut conn)
+            .await?;
 
         // Collect all unique IDs
-        let all_ids: Vec<&String> = wait
+        let all_ids: std::collections::HashSet<String> = wait
             .iter()
             .chain(paused.iter())
             .chain(active.iter())
@@ -559,19 +511,12 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             .chain(delayed.iter())
             .chain(completed.iter())
             .chain(failed.iter())
+            .chain(waiting_children.iter())
+            .cloned()
             .collect();
 
-        // Delete all job hashes, lock keys, and log keys
-        for id in &all_ids {
-            let job_key = self.key(id);
-            let lock_key = format!("{}:lock", job_key);
-            let logs_key = format!("{}:logs", job_key);
-            redis::cmd("DEL")
-                .arg(&job_key)
-                .arg(&lock_key)
-                .arg(&logs_key)
-                .query_async::<i64>(&mut conn)
-                .await?;
+        for id in all_ids {
+            cleanup_job(&mut conn, &self.prefix, &self.name, &id).await?;
         }
 
         // Delete all state keys and the ID counter
@@ -583,6 +528,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             .arg(self.key("delayed"))
             .arg(self.key("completed"))
             .arg(self.key("failed"))
+            .arg(self.key("waiting-children"))
             .arg(self.key("id"))
             .query_async::<i64>(&mut conn)
             .await?;

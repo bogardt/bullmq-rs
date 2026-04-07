@@ -116,7 +116,20 @@ impl FlowProducer {
             &mut next_auto_id,
             &mut seen_job_keys,
         )?;
-        ensure_job_keys_do_not_exist(&mut conn, &prepared).await?;
+        let planned_job_keys = collect_job_keys(&prepared);
+
+        let mut watch_cmd = redis::cmd("WATCH");
+        for job_key in &planned_job_keys {
+            watch_cmd.arg(job_key);
+        }
+        watch_cmd.query_async::<redis::Value>(&mut conn).await?;
+        let existence_result = ensure_job_keys_do_not_exist(&mut conn, &prepared).await;
+        if let Err(err) = existence_result {
+            let _ = redis::cmd("UNWATCH")
+                .query_async::<redis::Value>(&mut conn)
+                .await;
+            return Err(err);
+        }
 
         redis::cmd("MULTI").query_async::<redis::Value>(&mut conn).await?;
         let queue_result = queue_insert(&self.scripts, &mut conn, &prepared).await;
@@ -128,11 +141,7 @@ impl FlowProducer {
         }
 
         let exec_result: redis::Value = redis::cmd("EXEC").query_async(&mut conn).await?;
-        if matches!(exec_result, redis::Value::Nil) {
-            return Err(BullmqError::Other(
-                "Redis transaction aborted while creating flow".into(),
-            ));
-        }
+        validate_exec_result(exec_result)?;
 
         Ok(build_flow_node(
             prepared,
@@ -315,6 +324,34 @@ fn queue_insert_existing_check<'a, T>(
     node: &'a PreparedNode<T>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BullmqResult<()>> + 'a>> {
     Box::pin(async move { ensure_job_keys_do_not_exist(conn, node).await })
+}
+
+fn collect_job_keys<T>(node: &PreparedNode<T>) -> Vec<String> {
+    let mut keys = vec![node.job_key.clone()];
+    for child in &node.children {
+        keys.extend(collect_job_keys(child));
+    }
+    keys
+}
+
+fn validate_exec_result(result: redis::Value) -> BullmqResult<()> {
+    match result {
+        redis::Value::Nil => Err(BullmqError::Other(
+            "Redis transaction aborted while creating flow".into(),
+        )),
+        redis::Value::Array(values) => {
+            for value in values {
+                if let redis::Value::ServerError(err) = value {
+                    return Err(BullmqError::from(redis::RedisError::from(err)));
+                }
+            }
+            Ok(())
+        }
+        other => Err(BullmqError::Other(format!(
+            "Unexpected EXEC response while creating flow: {:?}",
+            other
+        ))),
+    }
 }
 
 fn queue_insert<'a, T>(

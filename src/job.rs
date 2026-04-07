@@ -501,41 +501,7 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
     pub async fn remove(&self) -> BullmqResult<()> {
         let ctx = self.ctx()?;
         let mut conn = ctx.conn.clone();
-        let job_id = &self.id;
-
-        // Remove from lists (LREM)
-        for suffix in &["wait", "active", "paused"] {
-            let key = build_key(&ctx.prefix, &ctx.queue_name, suffix);
-            redis::cmd("LREM")
-                .arg(&key)
-                .arg(0i64)
-                .arg(job_id)
-                .query_async::<i64>(&mut conn)
-                .await?;
-        }
-
-        // Remove from sorted sets (ZREM)
-        for suffix in &["prioritized", "delayed", "completed", "failed"] {
-            let key = build_key(&ctx.prefix, &ctx.queue_name, suffix);
-            redis::cmd("ZREM")
-                .arg(&key)
-                .arg(job_id)
-                .query_async::<i64>(&mut conn)
-                .await?;
-        }
-
-        // Delete the job hash, lock key, and logs key
-        let job_key = self.queue_key(job_id)?;
-        let lock_key = format!("{}:lock", job_key);
-        let logs_key = format!("{}:logs", job_key);
-        redis::cmd("DEL")
-            .arg(&job_key)
-            .arg(&lock_key)
-            .arg(&logs_key)
-            .query_async::<i64>(&mut conn)
-            .await?;
-
-        Ok(())
+        cleanup_job(&mut conn, &ctx.prefix, &ctx.queue_name, &self.id).await
     }
 
     /// Move this active job back to delayed with a new delay.
@@ -800,4 +766,71 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             "getChildrenValues requires Flows (not yet implemented)".into(),
         ))
     }
+}
+
+pub(crate) async fn cleanup_job(
+    conn: &mut ConnectionManager,
+    prefix: &str,
+    queue_name: &str,
+    job_id: &str,
+) -> BullmqResult<()> {
+    let job_key = build_key(prefix, queue_name, job_id);
+    let parent_key: Option<String> = redis::cmd("HGET")
+        .arg(&job_key)
+        .arg("parentKey")
+        .query_async(conn)
+        .await?;
+
+    for suffix in &["wait", "active", "paused"] {
+        let key = build_key(prefix, queue_name, suffix);
+        redis::cmd("LREM")
+            .arg(&key)
+            .arg(0i64)
+            .arg(job_id)
+            .query_async::<i64>(conn)
+            .await?;
+    }
+
+    for suffix in &[
+        "prioritized",
+        "delayed",
+        "completed",
+        "failed",
+        "waiting-children",
+    ] {
+        let key = build_key(prefix, queue_name, suffix);
+        redis::cmd("ZREM")
+            .arg(&key)
+            .arg(job_id)
+            .query_async::<i64>(conn)
+            .await?;
+    }
+
+    if let Some(parent_key) = parent_key {
+        redis::cmd("SREM")
+            .arg(format!("{parent_key}:dependencies"))
+            .arg(&job_key)
+            .query_async::<i64>(conn)
+            .await?;
+        redis::cmd("HDEL")
+            .arg(format!("{parent_key}:processed"))
+            .arg(&job_key)
+            .query_async::<i64>(conn)
+            .await?;
+    }
+
+    let lock_key = format!("{}:lock", job_key);
+    let logs_key = format!("{}:logs", job_key);
+    let dependencies_key = format!("{}:dependencies", job_key);
+    let processed_key = format!("{}:processed", job_key);
+    redis::cmd("DEL")
+        .arg(&job_key)
+        .arg(&lock_key)
+        .arg(&logs_key)
+        .arg(&dependencies_key)
+        .arg(&processed_key)
+        .query_async::<i64>(conn)
+        .await?;
+
+    Ok(())
 }
