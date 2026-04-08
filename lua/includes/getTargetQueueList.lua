@@ -4,14 +4,16 @@
 ]]
 local function getTargetQueueList(queueMetaKey, activeKey, waitKey, pausedKey)
   local queueAttributes = rcall("HMGET", queueMetaKey, "paused", "concurrency")
+  local isPaused = queueAttributes[1]
+  local concurrency = tonumber(queueAttributes[2])
 
-  if queueAttributes[1] then
+  if isPaused then
     return pausedKey, true
   end
 
-  if queueAttributes[2] then
+  if concurrency then
     local activeCount = rcall("LLEN", activeKey)
-    if activeCount >= tonumber(queueAttributes[2]) then
+    if activeCount >= concurrency then
       return waitKey, true
     end
   end

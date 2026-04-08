@@ -26,7 +26,9 @@ local function moveParentToWait(parentQueueKey, parentKey, parentId, timestamp)
     rcall("XADD", eventsKey, "*", "event", "delayed", "jobId", parentId, "delay", delayedTimestamp)
     addDelayMarkerIfNeeded(markerKey, delayedKey)
   elseif priority > 0 then
-    addJobWithPriority(markerKey, prioritizedKey, priority, parentId, pcKey, isPausedOrMaxed)
+    local score = getPriorityScore(priority, pcKey)
+    rcall("ZADD", prioritizedKey, score, parentId)
+    addBaseMarkerIfNeeded(markerKey, isPausedOrMaxed)
   else
     addJobInTargetList(target, markerKey, "RPUSH", isPausedOrMaxed, parentId)
   end

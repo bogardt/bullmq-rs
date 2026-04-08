@@ -1846,6 +1846,209 @@ async fn test_flow_releases_parent_with_bullmq_wait_order() {
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
+async fn test_flow_releases_parent_to_prioritized() {
+    let parent_queue = unique_queue_name();
+    let child_queue = unique_queue_name();
+    let conn = redis_conn();
+
+    let parent = QueueBuilder::new(&parent_queue)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let producer = FlowProducerBuilder::new()
+        .connection(conn.clone())
+        .build()
+        .await
+        .unwrap();
+
+    let child_worker = WorkerBuilder::new(&child_queue)
+        .connection(conn.clone())
+        .build::<TestJob>();
+    let child_handle = child_worker
+        .start(|_job| async move { Ok(()) })
+        .await
+        .unwrap();
+
+    let node = producer
+        .add(FlowJob {
+            name: "parent".into(),
+            queue_name: parent_queue.clone(),
+            data: TestJob { value: "p".into() },
+            prefix: None,
+            opts: Some(JobOptions {
+                priority: Some(10),
+                ..Default::default()
+            }),
+            children: vec![FlowJob {
+                name: "child".into(),
+                queue_name: child_queue.clone(),
+                data: TestJob { value: "c1".into() },
+                prefix: None,
+                opts: None,
+                children: vec![],
+            }],
+        })
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if parent.get_waiting_children_count().await.unwrap() == 0 {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("Timed out waiting for prioritized parent release");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut raw = raw_redis_conn().await;
+    let stored_priority: i64 = redis::cmd("HGET")
+        .arg(format!("bull:{}:{}", parent_queue, node.job.id))
+        .arg("priority")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(stored_priority, 10);
+
+    let counts = parent.get_job_counts().await.unwrap();
+
+    assert_eq!(*counts.get(&JobState::WaitingChildren).unwrap(), 0);
+    assert_eq!(*counts.get(&JobState::Prioritized).unwrap(), 1);
+    assert_eq!(
+        parent.get_waiting_count().await.unwrap(),
+        0,
+        "unexpected counts after prioritized parent release: {counts:?}"
+    );
+
+    let prioritized = parent.get_prioritized(0, -1).await.unwrap();
+    assert_eq!(prioritized.len(), 1);
+    assert_eq!(prioritized[0].id, node.job.id);
+
+    child_handle.shutdown();
+    child_handle.wait().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_flow_releases_parent_to_paused_queue() {
+    let parent_queue = unique_queue_name();
+    let child_queue = unique_queue_name();
+    let conn = redis_conn();
+
+    let parent = QueueBuilder::new(&parent_queue)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let producer = FlowProducerBuilder::new()
+        .connection(conn.clone())
+        .build()
+        .await
+        .unwrap();
+
+    parent.pause().await.unwrap();
+    assert!(parent.is_paused().await.unwrap());
+
+    let parent_seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let parent_seen_worker = parent_seen.clone();
+
+    let parent_worker = WorkerBuilder::new(&parent_queue)
+        .connection(conn.clone())
+        .build::<TestJob>();
+    let parent_handle = parent_worker
+        .start(move |job| {
+            let parent_seen_worker = parent_seen_worker.clone();
+            async move {
+                parent_seen_worker
+                    .lock()
+                    .await
+                    .push(format!("parent:{}", job.data.value));
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let child_worker = WorkerBuilder::new(&child_queue)
+        .connection(conn.clone())
+        .build::<TestJob>();
+    let child_handle = child_worker
+        .start(|_job| async move { Ok(()) })
+        .await
+        .unwrap();
+
+    producer
+        .add(FlowJob {
+            name: "parent".into(),
+            queue_name: parent_queue.clone(),
+            data: TestJob { value: "p".into() },
+            prefix: None,
+            opts: None,
+            children: vec![FlowJob {
+                name: "child".into(),
+                queue_name: child_queue.clone(),
+                data: TestJob { value: "c1".into() },
+                prefix: None,
+                opts: None,
+                children: vec![],
+            }],
+        })
+        .await
+        .unwrap();
+
+    let release_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let parent_released = parent.get_waiting_children_count().await.unwrap() == 0;
+        let waiting_includes_parent = parent.get_waiting_count().await.unwrap() == 1;
+        if parent_released && waiting_includes_parent {
+            break;
+        }
+        if tokio::time::Instant::now() > release_deadline {
+            panic!("Timed out waiting for paused parent release");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let counts = parent.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::WaitingChildren).unwrap(), 0);
+    assert_eq!(*counts.get(&JobState::Paused).unwrap(), 1);
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 0);
+    assert_eq!(parent.get_waiting_count().await.unwrap(), 1);
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert!(
+        parent_seen.lock().await.is_empty(),
+        "parent job should not be claimed while queue is paused"
+    );
+    assert_eq!(parent.get_completed_count().await.unwrap(), 0);
+
+    parent.resume().await.unwrap();
+
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if parent.get_completed_count().await.unwrap() == 1 {
+            break;
+        }
+        if tokio::time::Instant::now() > completion_deadline {
+            panic!("Timed out waiting for parent completion after resume");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(parent_seen.lock().await.as_slice(), ["parent:p"]);
+
+    child_handle.shutdown();
+    parent_handle.shutdown();
+    child_handle.wait().await.unwrap();
+    parent_handle.wait().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
 async fn test_flow_add_rejects_existing_custom_child_id() {
     let qname = unique_queue_name();
     let conn = redis_conn();
