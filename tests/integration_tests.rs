@@ -1863,6 +1863,20 @@ async fn test_flow_releases_parent_to_prioritized() {
         .await
         .unwrap();
 
+    let existing = parent
+        .add(
+            "existing-priority",
+            TestJob {
+                value: "existing".into(),
+            },
+            Some(JobOptions {
+                priority: Some(10),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
     let child_worker = WorkerBuilder::new(&child_queue)
         .connection(conn.clone())
         .build::<TestJob>();
@@ -1916,16 +1930,41 @@ async fn test_flow_releases_parent_to_prioritized() {
     let counts = parent.get_job_counts().await.unwrap();
 
     assert_eq!(*counts.get(&JobState::WaitingChildren).unwrap(), 0);
-    assert_eq!(*counts.get(&JobState::Prioritized).unwrap(), 1);
+    assert_eq!(*counts.get(&JobState::Prioritized).unwrap(), 2);
     assert_eq!(
         parent.get_waiting_count().await.unwrap(),
         0,
         "unexpected counts after prioritized parent release: {counts:?}"
     );
 
+    let prioritized_key = format!("bull:{parent_queue}:prioritized");
+    let existing_score: Option<f64> = redis::cmd("ZSCORE")
+        .arg(&prioritized_key)
+        .arg(&existing.id)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let parent_score: Option<f64> = redis::cmd("ZSCORE")
+        .arg(&prioritized_key)
+        .arg(&node.job.id)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let existing_score = existing_score.expect("existing prioritized job missing");
+    let parent_score = parent_score.expect("released parent missing from prioritized");
+    let priority_base = 10f64 * 4_294_967_296f64;
+    assert!(
+        existing_score >= priority_base && parent_score >= priority_base,
+        "prioritized scores must use BullMQ getPriorityScore base; existing={existing_score}, parent={parent_score}"
+    );
+    assert!(
+        parent_score > existing_score,
+        "same-priority parent released later should get a larger BullMQ score; existing={existing_score}, parent={parent_score}"
+    );
+
     let prioritized = parent.get_prioritized(0, -1).await.unwrap();
-    assert_eq!(prioritized.len(), 1);
-    assert_eq!(prioritized[0].id, node.job.id);
+    let prioritized_ids: Vec<String> = prioritized.into_iter().map(|job| job.id).collect();
+    assert_eq!(prioritized_ids, vec![existing.id.clone(), node.job.id.clone()]);
 
     child_handle.shutdown();
     child_handle.wait().await.unwrap();
