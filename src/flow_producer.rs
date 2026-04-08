@@ -130,6 +130,7 @@ impl FlowProducer {
                 .await;
             return Err(err);
         }
+        maybe_watch_window_hook(&mut conn, &root_queue).await?;
 
         redis::cmd("MULTI").query_async::<redis::Value>(&mut conn).await?;
         let queue_result = queue_insert(&self.scripts, &mut conn, &prepared).await;
@@ -300,7 +301,10 @@ where
 async fn ensure_job_keys_do_not_exist<T>(
     conn: &mut redis::aio::ConnectionManager,
     node: &PreparedNode<T>,
-) -> BullmqResult<()> {
+) -> BullmqResult<()>
+where
+    T: Sync,
+{
     let exists: bool = redis::cmd("EXISTS")
         .arg(&node.job_key)
         .query_async(conn)
@@ -322,7 +326,10 @@ async fn ensure_job_keys_do_not_exist<T>(
 fn queue_insert_existing_check<'a, T>(
     conn: &'a mut redis::aio::ConnectionManager,
     node: &'a PreparedNode<T>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = BullmqResult<()>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = BullmqResult<()>> + Send + 'a>>
+where
+    T: Sync,
+{
     Box::pin(async move { ensure_job_keys_do_not_exist(conn, node).await })
 }
 
@@ -354,11 +361,63 @@ fn validate_exec_result(result: redis::Value) -> BullmqResult<()> {
     }
 }
 
+#[cfg(debug_assertions)]
+async fn maybe_watch_window_hook(
+    conn: &mut redis::aio::ConnectionManager,
+    queue_name: &str,
+) -> BullmqResult<()> {
+    let target_queue = match std::env::var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_QUEUE") {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    if target_queue != queue_name {
+        return Ok(());
+    }
+
+    let open_key = match std::env::var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_OPEN_KEY") {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    let release_key = std::env::var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_RELEASE_KEY")
+        .map_err(|_| BullmqError::Other("Missing BULLMQ_RS_FLOW_ADD_WATCH_HOOK_RELEASE_KEY".into()))?;
+
+    redis::cmd("SET")
+        .arg(&open_key)
+        .arg("1")
+        .query_async::<redis::Value>(conn)
+        .await?;
+
+    loop {
+        let released: bool = redis::cmd("EXISTS")
+            .arg(&release_key)
+            .query_async(conn)
+            .await?;
+        if released {
+            redis::cmd("DEL")
+                .arg(&open_key)
+                .arg(&release_key)
+                .query_async::<redis::Value>(conn)
+                .await?;
+            return Ok(());
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(not(debug_assertions))]
+async fn maybe_watch_window_hook(
+    _conn: &mut redis::aio::ConnectionManager,
+    _queue_name: &str,
+) -> BullmqResult<()> {
+    Ok(())
+}
+
 fn queue_insert<'a, T>(
     scripts: &'a ScriptLoader,
     conn: &'a mut redis::aio::ConnectionManager,
     node: &'a PreparedNode<T>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = BullmqResult<()>> + 'a>>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = BullmqResult<()>> + Send + 'a>>
 where
     T: Serialize + DeserializeOwned + Send + Sync + 'static,
 {

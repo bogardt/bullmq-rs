@@ -1,5 +1,6 @@
 use bullmq_rs::*;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -25,12 +26,15 @@ async fn raw_redis_conn() -> redis::aio::ConnectionManager {
 
 /// Helper: generate a unique queue name for tests that need isolation.
 fn unique_queue_name() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .subsec_nanos();
-    format!("test_unique_{}", nanos)
+        .as_nanos();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    format!("test_unique_{}_{}_{}", pid, nanos, counter)
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,6 +1723,119 @@ async fn test_flow_remove_and_drain_cleanup_waiting_children_and_dependencies() 
         .await
         .unwrap();
     assert!(!third_deps_exists);
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_flow_add_rejects_watch_window_collision_cleanly() {
+    let qname = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+    queue.drain().await.unwrap();
+
+    let producer = FlowProducerBuilder::new()
+        .connection(conn.clone())
+        .build()
+        .await
+        .unwrap();
+
+    let colliding_id = "watched-colliding-child-id".to_string();
+    let hook_open_key = format!("test:flow-hook-open:{qname}");
+    let hook_release_key = format!("test:flow-hook-release:{qname}");
+    std::env::set_var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_QUEUE", &qname);
+    std::env::set_var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_OPEN_KEY", &hook_open_key);
+    std::env::set_var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_RELEASE_KEY", &hook_release_key);
+
+    let flow = FlowJob {
+        name: "parent".into(),
+        queue_name: qname.clone(),
+        data: TestJob {
+            value: "parent".into(),
+        },
+        prefix: None,
+        opts: None,
+        children: vec![FlowJob {
+            name: "child".into(),
+            queue_name: qname.clone(),
+            data: TestJob {
+                value: "child".into(),
+            },
+            prefix: None,
+            opts: Some(JobOptions {
+                job_id: Some(colliding_id.clone()),
+                ..Default::default()
+            }),
+            children: vec![],
+        }],
+    };
+
+    let add_handle = tokio::spawn(async move { producer.add(flow).await });
+
+    let mut raw = raw_redis_conn().await;
+    for _ in 0..200 {
+        let open: bool = redis::cmd("EXISTS")
+            .arg(&hook_open_key)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        if open {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let open: bool = redis::cmd("EXISTS")
+        .arg(&hook_open_key)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(open, "watch hook did not open");
+
+    queue
+        .add(
+            "competing",
+            TestJob {
+                value: "competing".into(),
+            },
+            Some(JobOptions {
+                job_id: Some(colliding_id.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    redis::cmd("SET")
+        .arg(&hook_release_key)
+        .arg("1")
+        .query_async::<redis::Value>(&mut raw)
+        .await
+        .unwrap();
+
+    let result = add_handle.await.unwrap();
+    std::env::remove_var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_QUEUE");
+    std::env::remove_var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_OPEN_KEY");
+    std::env::remove_var("BULLMQ_RS_FLOW_ADD_WATCH_HOOK_RELEASE_KEY");
+
+    let err = result.unwrap_err();
+    assert!(
+        err.to_string().contains("transaction aborted"),
+        "unexpected error: {err}"
+    );
+
+    assert_eq!(queue.get_waiting_children_count().await.unwrap(), 0);
+    assert_eq!(queue.get_waiting_count().await.unwrap(), 1);
+
+    let parent_keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("bull:{qname}:*:dependencies"))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(parent_keys.is_empty());
 }
 
 // ---------------------------------------------------------------------------
