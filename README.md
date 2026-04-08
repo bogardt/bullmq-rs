@@ -158,4 +158,8 @@ cargo run --example basic_worker
 
 ## License
 
-MIT OR Apache-2.0
+This project is licensed under `MIT OR Apache-2.0`.
+
+Parts of the BullMQ wire-compatibility layer are ported or adapted from
+[BullMQ](https://github.com/taskforcesh/bullmq), which is licensed under MIT.
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
