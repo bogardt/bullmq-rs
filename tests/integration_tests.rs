@@ -1607,13 +1607,22 @@ async fn test_flow_parent_runs_after_all_children_complete() {
         .await
         .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    let seen = seen.lock().await.clone();
-    assert_eq!(seen, vec!["child:c1", "child:c2", "parent:p"]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = seen.lock().await.clone();
+        if current == vec!["child:c1", "child:c2", "parent:p"] {
+            break;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("Timed out waiting for flow completion, saw {current:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     child_handle.shutdown();
     parent_handle.shutdown();
+    child_handle.wait().await.unwrap();
+    parent_handle.wait().await.unwrap();
 }
 
 #[tokio::test]
