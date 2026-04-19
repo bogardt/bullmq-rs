@@ -34,20 +34,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("Added 5 jobs to the queue");
 
-    // Create a worker with concurrency
+    // Create a worker with concurrency and lock_duration.
+    // WorkerBuilder::build() is synchronous — connections are established on start().
     let worker = WorkerBuilder::new("tasks")
         .connection(conn)
         .concurrency(2)
-        .poll_interval(Duration::from_millis(500))
+        .lock_duration(Duration::from_secs(30))
         .on_completed(|job| {
             println!("[completed] Job {} done", job.id);
         })
         .on_failed(|job, err| {
             println!("[failed] Job {} failed: {}", job.id, err);
         })
-        .build::<Task>()
-        .await?;
+        .build::<Task>();
 
+    // start() is async — it establishes Redis connections and begins processing.
+    // The handler returns Result<(), Box<dyn Error + Send + Sync>>.
     let handle = worker
         .start(|job| async move {
             println!(

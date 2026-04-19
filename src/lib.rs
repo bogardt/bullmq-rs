@@ -4,10 +4,13 @@
 //! distributed job queue with support for priorities, delays, retries with
 //! backoff, concurrency control, and typed job payloads.
 //!
+//! Wire-compatible with BullMQ Node.js v5.x — jobs created by this crate
+//! can be consumed by Node.js workers and vice versa.
+//!
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use bullmq_rs::{Queue, QueueBuilder, Worker, WorkerBuilder, RedisConnection, JobOptions};
+//! use bullmq_rs::{RedisConnection, QueueBuilder, WorkerBuilder, JobOptions};
 //! use serde::{Serialize, Deserialize};
 //! use std::time::Duration;
 //!
@@ -22,25 +25,24 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let conn = RedisConnection::new("redis://127.0.0.1:6379");
 //!
-//!     // Create a typed queue
-//!     let queue: Queue<Email> = QueueBuilder::new("emails")
+//!     // Create a queue
+//!     let queue = QueueBuilder::new("emails")
 //!         .connection(conn.clone())
-//!         .build()
+//!         .build::<Email>()
 //!         .await?;
 //!
 //!     // Add a job
 //!     queue.add("welcome", Email {
 //!         to: "user@example.com".into(),
 //!         subject: "Welcome!".into(),
-//!         body: "Hello and welcome.".into(),
+//!         body: "Thanks for signing up.".into(),
 //!     }, None).await?;
 //!
-//!     // Create a worker to process jobs
-//!     let worker: Worker<Email> = WorkerBuilder::new("emails")
+//!     // Create and start a worker
+//!     let worker = WorkerBuilder::new("emails")
 //!         .connection(conn)
-//!         .concurrency(3)
-//!         .build()
-//!         .await?;
+//!         .concurrency(5)
+//!         .build::<Email>();
 //!
 //!     let handle = worker.start(|job| async move {
 //!         println!("Sending email to {}", job.data.to);
@@ -56,14 +58,24 @@
 
 pub mod connection;
 pub mod error;
-pub mod job;
-pub mod queue;
+pub mod flow_producer;
 pub mod types;
+
+pub mod job;
+pub(crate) mod scripts;
+
+pub mod queue;
+pub mod queue_events;
+pub mod queue_events_producer;
+
 pub mod worker;
 
 pub use connection::RedisConnection;
 pub use error::{BullmqError, BullmqResult};
+pub use flow_producer::{FlowJob, FlowNode, FlowProducer, FlowProducerBuilder};
 pub use job::Job;
 pub use queue::{Queue, QueueBuilder};
-pub use types::{BackoffStrategy, JobOptions, JobState, WorkerOptions};
+pub use queue_events::{QueueEvent, QueueEvents, QueueEventsBuilder};
+pub use queue_events_producer::{QueueEventsProducer, QueueEventsProducerBuilder};
+pub use types::{BackoffStrategy, JobDependencies, JobOptions, JobState, WorkerOptions};
 pub use worker::{Worker, WorkerBuilder, WorkerHandle};
