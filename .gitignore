@@ -1,3 +1,8 @@
 /target
 .env
 ./redis-logs
+.wolf/
+.codegraph/
+.claude/
+docs/superpowers/
+CLAUDE.md

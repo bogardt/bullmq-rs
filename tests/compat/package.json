@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "description": "Cross-language compatibility tests for bullmq-rs v2",
+  "scripts": {
+    "test": "echo 'Run individual test scripts manually — see README'"
+  },
+  "dependencies": {
+    "bullmq": "^5.8.0",
+    "ioredis": "^5.0.0"
+  }
+}
