@@ -66,13 +66,60 @@ pub struct Worker<T> {
     _phantom: PhantomData<T>,
 }
 
-/// Handle to a running worker, used for shutdown.
+/// Handle to a running worker, used for pause/resume and shutdown.
 pub struct WorkerHandle {
     shutdown_tx: watch::Sender<bool>,
+    paused_tx: watch::Sender<bool>,
+    semaphore: Arc<Semaphore>,
+    concurrency: usize,
+    prefetched: Arc<std::sync::atomic::AtomicUsize>,
     join_handle: tokio::task::JoinHandle<()>,
 }
 
 impl WorkerHandle {
+    /// Pause the worker: stop fetching new jobs from the queue.
+    ///
+    /// Jobs already fetched keep processing. If `do_not_wait_active` is
+    /// `false`, this waits until all in-flight jobs have finished before
+    /// returning (mirrors BullMQ's `worker.pause(doNotWaitActive)`).
+    ///
+    /// This is local to the worker and does not pause the queue itself —
+    /// other workers keep processing. Use `Queue::pause` for global pause.
+    pub async fn pause(&self, do_not_wait_active: bool) {
+        let _ = self.paused_tx.send(true);
+
+        if do_not_wait_active {
+            return;
+        }
+
+        loop {
+            let prefetched = self.prefetched.load(std::sync::atomic::Ordering::SeqCst);
+            if prefetched == 0 && self.semaphore.available_permits() == self.concurrency {
+                return;
+            }
+            if self.join_handle.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Resume fetching jobs after a [`pause`](Self::pause).
+    pub fn resume(&self) {
+        let _ = self.paused_tx.send(false);
+    }
+
+    /// Whether the worker is currently paused.
+    pub fn is_paused(&self) -> bool {
+        *self.paused_tx.borrow()
+    }
+
+    /// Whether the worker is running (started and not shut down).
+    /// A paused worker is still considered running.
+    pub fn is_running(&self) -> bool {
+        !*self.shutdown_tx.borrow() && !self.join_handle.is_finished()
+    }
+
     /// Signal the worker to stop after finishing current jobs.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
@@ -124,6 +171,11 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         // Shutdown channel.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        // Pause channel and prefetched-jobs counter (jobs sitting in the
+        // fast-path channel, already active in Redis but not yet picked up).
+        let (paused_tx, paused_rx) = watch::channel(false);
+        let prefetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
         let handler = Arc::new(handler);
         let semaphore = Arc::new(Semaphore::new(self.options.concurrency));
         let scripts = self.scripts.clone();
@@ -143,6 +195,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             tokio::sync::mpsc::channel::<move_to_active::MoveToActiveResult>(concurrency);
         let next_job_rx = Arc::new(Mutex::new(next_job_rx));
 
+        let semaphore_handle = semaphore.clone();
+        let prefetched_handle = prefetched.clone();
+
         let join_handle = tokio::spawn({
             let scripts = scripts.clone();
             let name = name.clone();
@@ -150,6 +205,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             let token = token.clone();
             let active_jobs = active_jobs.clone();
             let shutdown_rx_main = shutdown_rx.clone();
+            let paused_rx_main = paused_rx.clone();
+            let prefetched = prefetched.clone();
 
             // Spawn the lock extender background task.
             let lock_extender_handle = {
@@ -258,6 +315,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
 
             async move {
                 let mut shutdown_rx = shutdown_rx_main;
+                let mut paused_rx = paused_rx_main;
                 let mut blocking_conn = blocking_conn;
                 let mut cmd_conn = cmd_conn;
                 let marker_key = format!("{}:{}:marker", prefix, name);
@@ -282,10 +340,21 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                         let mut rx = next_job_rx.lock().await;
                         rx.try_recv().ok()
                     };
+                    if fast_path_result.is_some() {
+                        prefetched.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
 
                     let move_result = if let Some(result) = fast_path_result {
-                        // We got a job from the fast-path channel.
+                        // We got a job from the fast-path channel. Process it even
+                        // when paused: it is already active and locked in Redis.
                         Some(result)
+                    } else if *paused_rx.borrow() {
+                        // Paused: do not fetch new jobs; wait for resume or shutdown.
+                        tokio::select! {
+                            _ = paused_rx.changed() => {},
+                            _ = shutdown_rx.changed() => {},
+                        }
+                        continue;
                     } else {
                         // BZPOPMIN on the marker key with 5-second timeout.
                         let bzpopmin_result: redis::RedisResult<redis::Value> =
@@ -503,6 +572,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             let active_jobs = active_jobs.clone();
                             let next_job_tx = next_job_tx.clone();
                             let task_lock_duration = lock_duration_ms;
+                            let task_paused_rx = paused_rx.clone();
+                            let task_prefetched = prefetched.clone();
 
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -517,9 +588,12 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                 // Run the user handler.
                                 match handler(job.clone()).await {
                                     Ok(()) => {
-                                        // Success: call moveToFinished(completed) with fetchNext=true.
+                                        // Success: call moveToFinished(completed).
+                                        // Skip fetchNext while paused so the pause settles
+                                        // instead of prefetching more work.
                                         let timestamp = now_ms();
                                         let attempts = job.attempts_made + 1;
+                                        let fetch_next = !*task_paused_rx.borrow();
 
                                         match move_to_finished::move_to_finished(
                                             &scripts,
@@ -532,7 +606,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             "{}", // return value (empty JSON object)
                                             "completed",
                                             DEFAULT_MAX_EVENTS,
-                                            true, // fetchNext
+                                            fetch_next,
                                             task_lock_duration,
                                             attempts,
                                         )
@@ -545,7 +619,15 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             ) => {
                                                 // Fast-path: send next job via channel.
                                                 if next.job_id.is_some() {
+                                                    task_prefetched.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    );
                                                     if let Err(e) = next_job_tx.try_send(next) {
+                                                        task_prefetched.fetch_sub(
+                                                            1,
+                                                            std::sync::atomic::Ordering::SeqCst,
+                                                        );
                                                         tracing::warn!(
                                                             "Fast-path channel full, prefetched job will be recovered via stalled check: {:?}",
                                                             e.into_inner().job_id
@@ -727,6 +809,10 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
 
         Ok(WorkerHandle {
             shutdown_tx,
+            paused_tx,
+            semaphore: semaphore_handle,
+            concurrency,
+            prefetched: prefetched_handle,
             join_handle,
         })
     }
