@@ -96,6 +96,63 @@ jobs:
       - name: Run integration tests
         run: cargo test --test integration_tests -- --ignored --test-threads=1
 
+  compat:
+    name: Wire compat (BullMQ Node.js)
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tests/compat/package-lock.json
+
+      - name: Install BullMQ Node.js
+        working-directory: tests/compat
+        run: npm ci
+
+      - name: Build compat examples
+        run: cargo build --examples
+
+      - name: "Rust -> Node: produce jobs with bullmq-rs"
+        run: cargo run --example compat_producer
+
+      - name: "Rust -> Node: read jobs with BullMQ Node.js"
+        working-directory: tests/compat
+        run: node rust_producer_node_reader.js
+
+      - name: "Node -> Rust: produce job with BullMQ Node.js"
+        working-directory: tests/compat
+        run: node node_producer.js
+
+      - name: "Node -> Rust: process job with bullmq-rs"
+        run: cargo run --example compat_worker
+
+      - name: "Node -> Rust: verify completion with BullMQ Node.js"
+        working-directory: tests/compat
+        run: node node_verify_completed.js
+
   docs:
     name: Docs build
     runs-on: ubuntu-latest

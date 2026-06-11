@@ -1074,7 +1074,7 @@ async fn test_job_clear_logs() {
 #[tokio::test]
 #[ignore = "requires running Redis"]
 async fn test_job_get_state() {
-    let queue = QueueBuilder::new(&unique_queue_name())
+    let queue = QueueBuilder::new(unique_queue_name())
         .connection(redis_conn())
         .build::<String>()
         .await
@@ -1096,7 +1096,7 @@ async fn test_job_get_state() {
 #[tokio::test]
 #[ignore = "requires running Redis"]
 async fn test_job_get_state_delayed() {
-    let queue = QueueBuilder::new(&unique_queue_name())
+    let queue = QueueBuilder::new(unique_queue_name())
         .connection(redis_conn())
         .build::<String>()
         .await
@@ -1236,7 +1236,7 @@ async fn test_job_change_priority() {
     let conn = RedisConnection::new(
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
     );
-    let queue = QueueBuilder::new(&unique_queue_name())
+    let queue = QueueBuilder::new(unique_queue_name())
         .connection(conn)
         .build::<String>()
         .await
@@ -1274,7 +1274,7 @@ async fn test_job_promote() {
     let conn = RedisConnection::new(
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
     );
-    let queue = QueueBuilder::new(&unique_queue_name())
+    let queue = QueueBuilder::new(unique_queue_name())
         .connection(conn)
         .build::<String>()
         .await
@@ -1387,7 +1387,7 @@ async fn test_job_remove() {
     let conn = RedisConnection::new(
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string()),
     );
-    let queue = QueueBuilder::new(&unique_queue_name())
+    let queue = QueueBuilder::new(unique_queue_name())
         .connection(conn)
         .build::<String>()
         .await
