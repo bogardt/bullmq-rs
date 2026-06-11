@@ -3126,3 +3126,220 @@ async fn test_wait_until_finished_already_completed() {
     qe.close().await.unwrap();
     queue.drain().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Worker pause/resume
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_pause_stops_fetching_and_resume_restarts() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+
+    // Pause before any job exists; give the loop time to park.
+    handle.pause(false).await;
+    assert!(handle.is_paused());
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    queue
+        .add(
+            "paused_job",
+            TestJob {
+                value: "should wait".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // The job must not be fetched while paused.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(
+        *counts.get(&JobState::Wait).unwrap(),
+        1,
+        "job should stay in wait while worker is paused"
+    );
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 0);
+
+    // Resume: the job gets processed.
+    handle.resume();
+    assert!(!handle.is_paused());
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(
+        *counts.get(&JobState::Completed).unwrap(),
+        1,
+        "job should be processed after resume"
+    );
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_pause_waits_for_active_jobs() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "slow",
+            TestJob {
+                value: "long job".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+
+    let handle = worker
+        .start(|_job| async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // Let the worker pick up the job.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // pause(false) must block until the in-flight job finishes.
+    let started = std::time::Instant::now();
+    handle.pause(false).await;
+    let elapsed = started.elapsed();
+
+    assert!(handle.is_paused());
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "pause should have waited for the active job, returned after {:?}",
+        elapsed
+    );
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(
+        *counts.get(&JobState::Completed).unwrap(),
+        1,
+        "active job should have completed before pause returned"
+    );
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_pause_do_not_wait_active_returns_immediately() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "slow",
+            TestJob {
+                value: "long job".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+
+    let handle = worker
+        .start(|_job| async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = std::time::Instant::now();
+    handle.pause(true).await;
+    let elapsed = started.elapsed();
+
+    assert!(handle.is_paused());
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "pause(do_not_wait_active) should return immediately, took {:?}",
+        elapsed
+    );
+
+    // The in-flight job still completes.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 1);
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_is_running_and_is_paused_states() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+
+    assert!(handle.is_running());
+    assert!(!handle.is_paused());
+
+    handle.pause(false).await;
+    assert!(handle.is_running(), "paused worker is still running");
+    assert!(handle.is_paused());
+
+    handle.resume();
+    assert!(handle.is_running());
+    assert!(!handle.is_paused());
+
+    handle.shutdown();
+    assert!(!handle.is_running(), "worker is not running after shutdown");
+    handle.wait().await.unwrap();
+}
