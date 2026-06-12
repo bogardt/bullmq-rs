@@ -45,6 +45,9 @@ ecosystem tooling works out of the box against queues produced by
   handle, `cancel_job`, manual fetch with `get_next_job` + `extend_job_locks`.
 - **Queue events** via Redis Streams — typed `QueueEvent` enum delivered
   through `tokio::broadcast`.
+- **Local worker events** — typed `WorkerEvent` enum (`Active`, `Completed`,
+  `Failed`, `Drained`, …) via `handle.subscribe()`, the Rust answer to
+  Node's worker-level `EventEmitter`.
 - **Flows** — `FlowProducer` for parent/child job trees, same-queue and
   cross-queue, with parent-release on child completion.
 - **Job active-handle API** — `update_progress`, `log`, `retry`,
@@ -60,7 +63,7 @@ Node v5, see [BULLMQ_V5_PARITY.md](BULLMQ_V5_PARITY.md).
 
 ```toml
 [dependencies]
-bullmq-rs = "2"
+bullmq-rs = "2.2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -250,6 +253,119 @@ queue.remove_job_scheduler("cleanup").await?;
 Workers process scheduler jobs like any other job and automatically
 enqueue the next iteration on completion.
 
+### 6. Local worker events
+
+```rust
+use bullmq_rs::WorkerEvent;
+
+let handle = worker.start(|_job| async move { Ok(()) }).await?;
+
+let mut events = handle.subscribe();
+tokio::spawn(async move {
+    while let Ok(event) = events.recv().await {
+        match event {
+            WorkerEvent::Active { job }            => println!("▶ {}", job.id),
+            WorkerEvent::Completed { job }         => println!("✅ {}", job.id),
+            WorkerEvent::Failed { job, reason }    => println!("❌ {}: {reason}", job.id),
+            WorkerEvent::Drained                   => println!("queue drained"),
+            _ => {}
+        }
+    }
+});
+```
+
+Process-local equivalent of Node's worker-level `EventEmitter` — for
+cross-process events use `QueueEvents` (section 3).
+
+## More recipes
+
+### Deduplication
+
+```rust
+use bullmq_rs::{DeduplicationOptions, JobOptions};
+
+// While the dedup key lives (TTL or until the job finishes),
+// adds with the same id return the EXISTING job instead of a new one.
+let job = queue.add("sync", data, Some(JobOptions {
+    deduplication: Some(DeduplicationOptions {
+        id: "sync-user-42".into(),
+        ttl: Some(Duration::from_secs(60)),
+    }),
+    ..Default::default()
+})).await?;
+```
+
+### Rate limiting
+
+```rust
+use bullmq_rs::{BullmqError, RateLimiterOptions};
+
+// Max 10 jobs per second, shared across ALL workers of the queue
+// (including Node.js ones).
+let worker = WorkerBuilder::new("emails")
+    .connection(conn)
+    .limiter(RateLimiterOptions { max: 10, duration: Duration::from_secs(1) })
+    .build::<Email>();
+
+// Manual rate limiting from inside a handler: the job goes back to
+// wait WITHOUT consuming an attempt.
+let handle = worker.start(|job| async move {
+    if upstream_api_throttled() {
+        return Err(Box::new(BullmqError::RateLimited));
+    }
+    Ok(())
+}).await?;
+
+// Dynamic, queue-wide: block fetching for 30s.
+queue.rate_limit(Duration::from_secs(30)).await?;
+queue.remove_rate_limit_key().await?;
+```
+
+### Worker pause / cooperative cancellation
+
+```rust
+// Pause this worker (jobs keep accumulating; other workers unaffected).
+handle.pause(false).await;   // waits for in-flight jobs
+handle.resume();
+
+// Cooperative cancellation: the handler receives a CancellationToken.
+let handle = worker.start_with_signal(|job, token| async move {
+    tokio::select! {
+        _ = token.cancelled() => Err("cancelled".into()),
+        _ = do_work(&job) => Ok(()),
+    }
+}).await?;
+handle.cancel_job(&job_id);  // triggers the token, force-aborts after 5s
+```
+
+### Metrics
+
+```rust
+use bullmq_rs::{JobState, MetricsOptions};
+
+let worker = WorkerBuilder::new("emails")
+    .connection(conn)
+    .metrics(MetricsOptions { max_data_points: 60 * 24 })  // 1 day of minutes
+    .build::<Email>();
+
+// Later, from anywhere:
+let metrics = queue.get_metrics(JobState::Completed, 0, -1).await?;
+println!("{} completed, {} data points", metrics.meta.count, metrics.count);
+```
+
+### Retention & bulk operations
+
+```rust
+// Remove completed jobs older than 1h (up to 1000).
+queue.clean(Duration::from_secs(3600), 1000, JobState::Completed).await?;
+
+// Re-enqueue all failed jobs.
+queue.retry_jobs(1000, JobState::Failed, None).await?;
+
+// Nuke the queue entirely (must have no active jobs unless force).
+queue.obliterate(false).await?;
+```
+
 ## Interop with BullMQ Node
 
 Because the Redis wire format matches BullMQ v5, you can mix Rust and
@@ -333,8 +449,10 @@ cd tests/compat && npm install
 ## Examples
 
 ```sh
-cargo run --example basic_queue
-cargo run --example basic_worker
+cargo run --example basic_queue       # add jobs (simple, delayed, prioritized, retried)
+cargo run --example basic_worker      # process jobs with concurrency
+cargo run --example repeatable_jobs   # JobScheduler: every-interval, inspect, remove
+cargo run --example worker_events     # subscribe to typed WorkerEvent stream
 ```
 
 ## Documentation

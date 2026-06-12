@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-06-12
+
 ### Added
 
 - **Typed local worker events** — `WorkerEvent` enum (`Active`, `Completed`,
@@ -204,7 +206,8 @@ The Lua scripts under `lua/` are ports of [BullMQ](https://github.com/taskforces
 
 - First public release.
 
-[Unreleased]: https://github.com/bogardt/bullmq-rs/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/bogardt/bullmq-rs/compare/v2.2.0...HEAD
+[2.2.0]: https://github.com/bogardt/bullmq-rs/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/bogardt/bullmq-rs/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/bogardt/bullmq-rs/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/bogardt/bullmq-rs/compare/v0.2.2...v1.1.0
