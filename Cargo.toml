@@ -1,13 +1,13 @@
 [package]
 name = "bullmq-rs"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["Thomas Bogard <thom.bogard@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "A Rust implementation of BullMQ - Redis-based distributed job queue"
 readme = "README.md"
-homepage = "https://github.com/bogardt/bullmq_rust"
-repository = "https://github.com/bogardt/bullmq_rust"
+homepage = "https://github.com/bogardt/bullmq-rs"
+repository = "https://github.com/bogardt/bullmq-rs"
 keywords = ["bullmq", "redis", "queue", "job", "async"]
 categories = ["asynchronous", "database"]
 

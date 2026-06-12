@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This cycle closes the [BullMQ v5 parity roadmap (#4)](https://github.com/bogardt/bullmq-rs/issues/4):
+## [2.1.0] — 2026-06-12
+
+This release closes the [BullMQ v5 parity roadmap (#4)](https://github.com/bogardt/bullmq-rs/issues/4):
 everything listed under "Deliberately not in this release" for 2.0.0 has landed,
 except sandboxed processors (out of scope pending a design discussion).
 
@@ -27,6 +29,10 @@ except sandboxed processors (out of scope pending a design discussion).
 - **Rate limiting** — `WorkerOptions::limiter` / `WorkerBuilder::limiter`
   with `RateLimiterOptions { max, duration }`; limiter logic restored in
   `moveToActive-11` / `moveToFinished-14` (shared `limiter` key, Node-compatible).
+  Dynamic rate limiting: `Queue::rate_limit(duration)`,
+  `Queue::remove_rate_limit_key()`, `WorkerHandle::rate_limit(duration)`, and
+  `BullmqError::RateLimited` — a handler returning it puts the job back in
+  wait without consuming an attempt (`moveJobFromActiveToWait-9` Lua port).
 - **Deduplication** — `JobOptions::deduplication` with
   `DeduplicationOptions { id, ttl }`; restored in the add-job scripts and
   `storeJob`; dedup key cleared on finalization; deduplicated adds return
@@ -35,9 +41,13 @@ except sandboxed processors (out of scope pending a design discussion).
   (`MetricsOptions { max_data_points }`) and `Queue::get_metrics(state, start, end)`
   (`getMetrics-2` Lua port, per-minute data points).
 - **Worker control surface** — `WorkerHandle::pause(do_not_wait_active)`,
-  `resume`, `is_paused`, `is_running`; `WorkerHandle::cancel_job` (aborts the
-  in-flight processing future; the job is requeued via stalled-job recovery);
+  `resume`, `is_paused`, `is_running`; `WorkerHandle::cancel_job` with
+  cooperative cancellation (`Worker::start_with_signal` hands the handler a
+  `CancellationToken`; the future is force-aborted after a 5 s grace period);
   `WorkerBuilder::on_active` / `on_error` callbacks.
+- **Atomic job removal** — `Queue::remove` / `Job::remove` now use the
+  `removeJob-2` Lua port: the deduplication key is purged with the job and a
+  `removed` event is emitted.
 - **Manual processing** — `Queue::get_next_job(token)`,
   `Job::move_to_completed` / `move_to_failed`,
   `Queue::extend_job_locks(job_ids, tokens, duration)` (`extendLocks-1` Lua port).
@@ -47,11 +57,10 @@ except sandboxed processors (out of scope pending a design discussion).
 
 ### Known limitations
 
-- Dynamic `queue.rateLimit()` / manual rate-limit errors are not ported
-  (only the worker-level `limiter` option).
 - Deduplication `replace` / `extend` / `keepLastIfActive` modes are not exposed.
-- `cancel_job` aborts the future without cooperative `AbortSignal` semantics.
 - The repeat strategy is not pluggable (default cron/every strategy only).
+- `Queue::remove` does not remove child jobs (`remove_children=false`,
+  whereas Node defaults to `true`).
 
 ## [2.0.0] — BullMQ v5 wire compatibility
 
@@ -185,7 +194,8 @@ The Lua scripts under `lua/` are ports of [BullMQ](https://github.com/taskforces
 
 - First public release.
 
-[Unreleased]: https://github.com/bogardt/bullmq-rs/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/bogardt/bullmq-rs/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/bogardt/bullmq-rs/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/bogardt/bullmq-rs/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/bogardt/bullmq-rs/compare/v0.2.2...v1.1.0
 [0.2.2]: https://github.com/bogardt/bullmq-rs/compare/v0.2.1...v0.2.2
