@@ -39,6 +39,8 @@
 ]]
 local rcall = redis.call
 
+--@include "batches"
+--@include "collectMetrics"
 --@include "removeLock"
 --@include "addBaseMarkerIfNeeded"
 --@include "addJobInTargetList"
@@ -53,6 +55,7 @@ local rcall = redis.call
 --@include "moveParentToWaitIfNoPendingDependencies"
 --@include "updateParentDepsIfNeeded"
 --@include "promoteDelayedJobs"
+--@include "removeDeduplicationKeyIfNeededOnFinalization"
 
 local waitKey = KEYS[1]
 local activeKey = KEYS[2]
@@ -95,6 +98,9 @@ end
 
 -- 3. Remove from active list
 rcall("LREM", activeKey, 1, jobId)
+
+local deduplicationId = rcall("HGET", jobKey, "deid")
+removeDeduplicationKeyIfNeededOnFinalization(jobKeyPrefix, deduplicationId, jobId)
 
 -- 4. Add to finished set (scored by timestamp)
 rcall("ZADD", finishedKey, timestamp, jobId)
@@ -145,6 +151,12 @@ rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*",
       "event", targetState, "jobId", jobId,
       targetState == "completed" and "returnvalue" or "failedReason", returnvalue,
       "prev", "active")
+
+-- Collect metrics
+if maxMetricsSize ~= "" then
+  local metricsKey = jobKeyPrefix .. "metrics:" .. targetState
+  collectMetrics(metricsKey, metricsKey .. ':data', maxMetricsSize, timestamp)
+end
 
 -- 7. If fetchNext requested, try to get the next job (same logic as moveToActive)
 if fetchNext == 1 then

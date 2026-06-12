@@ -11,10 +11,17 @@ use crate::connection::RedisConnection;
 use crate::error::{BullmqError, BullmqResult};
 use crate::job::{cleanup_job, Job, JobContext};
 use crate::scripts::commands::{
-    add_delayed_job, add_log, add_prioritized_job, add_standard_job, pause,
+    add_delayed_job, add_log, add_prioritized_job, add_standard_job, move_jobs_to_wait, pause,
 };
 use crate::scripts::ScriptLoader;
-use crate::types::{JobOptions, JobState, DEFAULT_MAX_EVENTS};
+use crate::types::{JobOptions, JobState, Metrics, DEFAULT_MAX_EVENTS};
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// A typed job queue backed by Redis.
 ///
@@ -150,6 +157,12 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
     /// - otherwise uses `addStandardJob`
     ///
     /// Returns the created job with its assigned ID.
+    ///
+    /// When [`JobOptions::deduplication`] is set and a deduplication key
+    /// (`<prefix>:<queue>:de:<id>`) already exists, the add is deduplicated:
+    /// no new job is created and the returned job carries the EXISTING job's
+    /// ID (mirroring BullMQ Node, where `Queue.add` returns a job whose `id`
+    /// is the deduplicated job's id).
     pub async fn add(&self, name: &str, data: T, opts: Option<JobOptions>) -> BullmqResult<Job<T>> {
         let mut conn = self.conn.clone();
 
@@ -165,65 +178,198 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             }
         };
 
-        let job = Job::new(job_id.clone(), name.to_string(), data, opts);
+        let mut job = Job::new(job_id, name.to_string(), data, opts);
+        self.dispatch_add(&mut conn, &job).await?;
+        job.ctx = Some(self.job_context());
 
+        Ok(job)
+    }
+
+    /// Run the appropriate add script (delayed/prioritized/standard) for a job.
+    async fn dispatch_add(&self, conn: &mut ConnectionManager, job: &Job<T>) -> BullmqResult<()> {
         let data_json = serde_json::to_string(&job.data)?;
         let opts_json = serde_json::to_string(&job.opts)?;
         let timestamp = job.timestamp;
 
-        if job.delay > 0 {
+        let dedup_key = job
+            .opts
+            .deduplication
+            .as_ref()
+            .map(|d| self.key(&format!("de:{}", d.id)))
+            .unwrap_or_default();
+
+        let returned_id = if job.delay > 0 {
             // Delayed job: compute the delayed timestamp.
             let delayed_timestamp = timestamp + job.delay;
             add_delayed_job::add_delayed_job(
                 &self.scripts,
-                &mut conn,
+                conn,
                 &self.prefix,
                 &self.name,
-                &job_id,
-                name,
+                &job.id,
+                &job.name,
                 &data_json,
                 timestamp,
                 &opts_json,
                 DEFAULT_MAX_EVENTS,
                 delayed_timestamp,
+                &dedup_key,
             )
-            .await?;
+            .await?
         } else if job.priority > 0 {
-            // Prioritized job.
             add_prioritized_job::add_prioritized_job(
                 &self.scripts,
-                &mut conn,
+                conn,
                 &self.prefix,
                 &self.name,
-                &job_id,
-                name,
+                &job.id,
+                &job.name,
                 &data_json,
                 timestamp,
                 &opts_json,
                 DEFAULT_MAX_EVENTS,
+                &dedup_key,
             )
-            .await?;
+            .await?
         } else {
-            // Standard job.
             add_standard_job::add_standard_job(
+                &self.scripts,
+                conn,
+                &self.prefix,
+                &self.name,
+                &job.id,
+                &job.name,
+                &data_json,
+                timestamp,
+                &opts_json,
+                DEFAULT_MAX_EVENTS,
+                &dedup_key,
+            )
+            .await?
+        };
+
+        let mut job = job;
+        job.id = returned_id;
+        job.ctx = Some(self.job_context());
+
+    /// Add multiple jobs to the queue.
+    ///
+    /// Mirrors Node BullMQ `Queue.addBulk`: each job is a `(name, data, opts)`
+    /// tuple following the same semantics as [`Queue::add`]. Auto-generated job
+    /// IDs are reserved with a single `INCRBY` instead of one `INCR` per job.
+    ///
+    /// Returns the created jobs in input order with their assigned IDs.
+    pub async fn add_bulk(
+        &self,
+        jobs: Vec<(String, T, Option<JobOptions>)>,
+    ) -> BullmqResult<Vec<Job<T>>> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = self.conn.clone();
+
+        let auto_id_count = jobs
+            .iter()
+            .filter(|(_, _, opts)| opts.as_ref().and_then(|o| o.job_id.as_ref()).is_none())
+            .count() as i64;
+
+        let mut next_id: i64 = if auto_id_count > 0 {
+            let last_id: i64 = redis::cmd("INCRBY")
+                .arg(self.key("id"))
+                .arg(auto_id_count)
+                .query_async(&mut conn)
+                .await?;
+            last_id - auto_id_count + 1
+        } else {
+            0
+        };
+
+        let ctx = self.job_context();
+        let mut created = Vec::with_capacity(jobs.len());
+
+        for (name, data, opts) in jobs {
+            let job_id = match opts.as_ref().and_then(|o| o.job_id.clone()) {
+                Some(custom_id) => custom_id,
+                None => {
+                    let id = next_id;
+                    next_id += 1;
+                    id.to_string()
+                }
+            };
+
+            let mut job = Job::new(job_id, name, data, opts);
+            self.dispatch_add(&mut conn, &job).await?;
+            job.ctx = Some(ctx.clone());
+            created.push(job);
+        }
+
+        Ok(created)
+    }
+
+    /// Retry failed (or completed) jobs by moving them back to wait.
+    ///
+    /// Mirrors Node BullMQ `Queue.retryJobs`: loops the `moveJobsToWait`
+    /// script, moving up to `count` jobs per iteration, until the cursor
+    /// reaches 0. Only jobs finished at or before `timestamp` (default: now)
+    /// are moved. `state` must be [`JobState::Failed`] or
+    /// [`JobState::Completed`].
+    pub async fn retry_jobs(
+        &self,
+        count: u64,
+        state: JobState,
+        timestamp: Option<u64>,
+    ) -> BullmqResult<()> {
+        if !matches!(state, JobState::Failed | JobState::Completed) {
+            return Err(BullmqError::Other(format!(
+                "retry_jobs only supports failed or completed states, got: {}",
+                state
+            )));
+        }
+
+        let timestamp = timestamp.unwrap_or_else(now_ms).to_string();
+        self.move_jobs_to_wait(count, &state.to_string(), &timestamp)
+            .await
+    }
+
+    /// Promote all delayed jobs to the wait list.
+    ///
+    /// Mirrors Node BullMQ `Queue.promoteJobs`: loops the `moveJobsToWait`
+    /// script with the `delayed` state and an unbounded timestamp, moving up
+    /// to `count` jobs per iteration, until the cursor reaches 0.
+    pub async fn promote_jobs(&self, count: u64) -> BullmqResult<()> {
+        // Node passes Number.MAX_VALUE so every delayed job matches.
+        self.move_jobs_to_wait(count, "delayed", "1.7976931348623157e+308")
+            .await
+    }
+
+    async fn move_jobs_to_wait(
+        &self,
+        count: u64,
+        state: &str,
+        timestamp: &str,
+    ) -> BullmqResult<()> {
+        // Node defaults count to 1000; count 0 would loop forever since the
+        // script returns 1 whenever the remaining budget is exhausted.
+        let count = if count == 0 { 1000 } else { count };
+        let mut conn = self.conn.clone();
+
+        loop {
+            let cursor = move_jobs_to_wait::move_jobs_to_wait(
                 &self.scripts,
                 &mut conn,
                 &self.prefix,
                 &self.name,
-                &job_id,
-                name,
-                &data_json,
+                state,
+                count,
                 timestamp,
-                &opts_json,
-                DEFAULT_MAX_EVENTS,
             )
             .await?;
+
+            if cursor == 0 {
+                return Ok(());
+            }
         }
-
-        let mut job = job;
-        job.ctx = Some(self.job_context());
-
-        Ok(job)
     }
 
     /// Get a job by its ID.
@@ -614,6 +760,84 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
         .await
     }
 
+    /// Remove jobs in a given state older than the grace period.
+    ///
+    /// `grace` is the minimum age of the jobs to be removed, `limit` caps the
+    /// number of removed jobs (`0` = unlimited), and `state` selects which
+    /// set to clean: `Completed` (default in BullMQ), `Failed`, `Wait`,
+    /// `Paused`, `Active`, `Delayed` or `Prioritized`.
+    ///
+    /// Returns the ids of the removed jobs.
+    pub async fn clean(
+        &self,
+        grace: std::time::Duration,
+        limit: u64,
+        state: JobState,
+    ) -> BullmqResult<Vec<String>> {
+        if state == JobState::WaitingChildren {
+            return Err(BullmqError::Other(
+                "Cannot clean waiting-children jobs".to_string(),
+            ));
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let timestamp = now_ms.saturating_sub(grace.as_millis() as u64);
+        let set_name = state.to_string();
+
+        // Mirrors BullMQ: iterate in chunks of at most 10k removals per call.
+        let max_count = if limit == 0 { u64::MAX } else { limit };
+        let max_count_per_call = max_count.min(10_000);
+
+        let mut conn = self.conn.clone();
+        let mut deleted_job_ids = Vec::new();
+        while (deleted_job_ids.len() as u64) < max_count {
+            let job_ids = clean_jobs_in_set::clean_jobs_in_set(
+                &self.scripts,
+                &mut conn,
+                &self.prefix,
+                &self.name,
+                &set_name,
+                timestamp,
+                max_count_per_call,
+            )
+            .await?;
+            let batch_len = job_ids.len() as u64;
+            deleted_job_ids.extend(job_ids);
+            if batch_len < max_count_per_call {
+                break;
+            }
+        }
+        Ok(deleted_job_ids)
+    }
+
+    /// Completely destroy the queue and all of its contents.
+    ///
+    /// The queue is paused first, then all job data and queue keys are
+    /// removed iteratively. Fails if the queue has active jobs, unless
+    /// `force` is `true`.
+    pub async fn obliterate(&self, force: bool) -> BullmqResult<()> {
+        self.pause().await?;
+
+        let mut conn = self.conn.clone();
+        loop {
+            let cursor = obliterate::obliterate(
+                &self.scripts,
+                &mut conn,
+                &self.prefix,
+                &self.name,
+                1000,
+                force,
+            )
+            .await?;
+            if cursor == 0 {
+                return Ok(());
+            }
+        }
+    }
+
     /// Check if the queue is currently paused.
     ///
     /// Returns `true` if the `paused` field exists in the queue's meta hash.
@@ -662,6 +886,40 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             .await?;
 
         Ok(logs)
+    }
+
+    /// Get queue metrics for a finished state.
+    ///
+    /// `state` must be [`JobState::Completed`] or [`JobState::Failed`].
+    /// `start` and `end` select a range of data points (`0` is the newest,
+    /// `-1` the oldest), mirroring BullMQ's `Queue.getMetrics`.
+    ///
+    /// Metrics are only collected by workers configured with
+    /// [`crate::WorkerBuilder::metrics`].
+    pub async fn get_metrics(
+        &self,
+        state: JobState,
+        start: i64,
+        end: i64,
+    ) -> BullmqResult<Metrics> {
+        if state != JobState::Completed && state != JobState::Failed {
+            return Err(BullmqError::Other(format!(
+                "get_metrics only supports completed or failed states, got: {}",
+                state
+            )));
+        }
+
+        let mut conn = self.conn.clone();
+        get_metrics::get_metrics(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            &state.to_string(),
+            start,
+            end,
+        )
+        .await
     }
 
     /// Get the queue name.

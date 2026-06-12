@@ -17,16 +17,18 @@
   ARGV[7] = delayedTimestamp (the target timestamp when the job should run)
   ARGV[8] = parentKey (optional)
   ARGV[9] = parent (optional)
+  ARGV[10] = deduplication key (optional, prefix:queueName:de:<dedupId>)
 
-  Returns: jobId
+  Returns: jobId (the existing job's id when the add is deduplicated)
 
-  Ported from BullMQ (stripped: parent/flow, dedup, repeat, debounce).
+  Ported from BullMQ (stripped: parent/flow, repeat).
 ]]
 local rcall = redis.call
 
 --@include "storeJob"
 --@include "getDelayedScore"
 --@include "addDelayMarkerIfNeeded"
+--@include "deduplicateJob"
 
 local delayedKey = KEYS[1]
 local metaKey = KEYS[2]
@@ -44,6 +46,7 @@ local maxEvents = tonumber(ARGV[6]) or 10000
 local delayedTimestamp = tonumber(ARGV[7])
 local parentKey = ARGV[8]
 local parentData = ARGV[9]
+local deduplicationKey = ARGV[10]
 
 if parentKey == "" then
   parentKey = nil
@@ -51,10 +54,19 @@ end
 if parentData == "" then
   parentData = nil
 end
+if deduplicationKey == "" then
+  deduplicationKey = nil
+end
 
 -- Idempotent: if job hash already exists, return the jobId
 if rcall("EXISTS", jobIdKey) == 1 then
   return jobId
+end
+
+local deduplicationJobId = deduplicateJob(opts['de'], jobId, deduplicationKey,
+                                          eventsKey, maxEvents)
+if deduplicationJobId then
+  return deduplicationJobId
 end
 
 local delay = opts['delay'] or 0

@@ -16,6 +16,10 @@ use crate::job::{Job, JobContext};
 type CompletedCallback = Arc<dyn Fn(&Job<serde_json::Value>) + Send + Sync>;
 /// Type alias for the on_failed callback.
 type FailedCallback = Arc<dyn Fn(&Job<serde_json::Value>, &BullmqError) + Send + Sync>;
+/// Type alias for the on_active callback.
+type ActiveCallback = Arc<dyn Fn(&Job<serde_json::Value>) + Send + Sync>;
+/// Type alias for the on_error callback.
+type ErrorCallback = Arc<dyn Fn(&BullmqError) + Send + Sync>;
 use crate::scripts::commands::{
     extend_lock, move_stalled_jobs_to_wait, move_to_active, move_to_delayed, move_to_finished,
 };
@@ -63,6 +67,8 @@ pub struct Worker<T> {
     options: WorkerOptions,
     on_completed: Option<CompletedCallback>,
     on_failed: Option<FailedCallback>,
+    on_active: Option<ActiveCallback>,
+    on_error: Option<ErrorCallback>,
     _phantom: PhantomData<T>,
 }
 
@@ -183,6 +189,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         let prefix = self.prefix.clone();
         let on_completed = self.on_completed.clone();
         let on_failed = self.on_failed.clone();
+        let on_active = self.on_active.clone();
+        let on_error = self.on_error.clone();
+        let max_metrics_size = self.options.metrics.as_ref().map(|m| m.max_data_points);
         let lock_duration_ms = self.options.lock_duration.as_millis() as u64;
         let limiter = self.options.limiter;
         let stalled_interval = self.options.stalled_interval;
@@ -396,6 +405,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                         if let Err(ref e) = bzpopmin_result {
                             if !is_bzpopmin_timeout(e) {
                                 tracing::warn!("BZPOPMIN error: {}, retrying after delay", e);
+                                if let Some(ref cb) = on_error {
+                                    cb(&BullmqError::Other(format!("BZPOPMIN error: {}", e)));
+                                }
                                 tokio::select! {
                                     _ = tokio::time::sleep(Duration::from_secs(1)) => {},
                                     _ = shutdown_rx.changed() => break,
@@ -433,6 +445,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         }
                                         Err(e) => {
                                             tracing::warn!("moveToActive error: {}", e);
+                                            if let Some(ref cb) = on_error {
+                                                cb(&e);
+                                            }
                                             None
                                         }
                                     }
@@ -474,6 +489,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         }
                                         Err(e) => {
                                             tracing::warn!("moveToActive error after delay: {}", e);
+                                            if let Some(ref cb) = on_error {
+                                                cb(&e);
+                                            }
                                             continue;
                                         }
                                     }
@@ -503,6 +521,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         Ok(_) => None,
                                         Err(e) => {
                                             tracing::warn!("moveToActive error: {}", e);
+                                            if let Some(ref cb) = on_error {
+                                                cb(&e);
+                                            }
                                             None
                                         }
                                     }
@@ -610,6 +631,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             let task_token = token.clone();
                             let on_completed = on_completed.clone();
                             let on_failed = on_failed.clone();
+                            let on_active = on_active.clone();
                             let active_jobs = active_jobs.clone();
                             let next_job_tx = next_job_tx.clone();
                             let task_lock_duration = lock_duration_ms;
@@ -624,6 +646,13 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                 {
                                     let mut set = active_jobs.lock().await;
                                     set.insert(job_id.clone());
+                                }
+
+                                // Invoke on_active callback.
+                                if let Some(ref cb) = on_active {
+                                    if let Ok(val_job) = convert_job_to_value(&job) {
+                                        cb(&val_job);
+                                    }
                                 }
 
                                 // Run the user handler.
@@ -900,6 +929,8 @@ pub struct WorkerBuilder {
     options: WorkerOptions,
     on_completed: Option<CompletedCallback>,
     on_failed: Option<FailedCallback>,
+    on_active: Option<ActiveCallback>,
+    on_error: Option<ErrorCallback>,
 }
 
 impl WorkerBuilder {
@@ -912,6 +943,8 @@ impl WorkerBuilder {
             options: WorkerOptions::default(),
             on_completed: None,
             on_failed: None,
+            on_active: None,
+            on_error: None,
         }
     }
 
@@ -983,6 +1016,24 @@ impl WorkerBuilder {
         self
     }
 
+    /// Set a callback invoked when a job starts processing.
+    pub fn on_active<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Job<serde_json::Value>) + Send + Sync + 'static,
+    {
+        self.on_active = Some(Arc::new(f));
+        self
+    }
+
+    /// Set a callback invoked on internal worker errors (fetch loop failures).
+    pub fn on_error<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&BullmqError) + Send + Sync + 'static,
+    {
+        self.on_error = Some(Arc::new(f));
+        self
+    }
+
     /// Build the worker.
     ///
     /// Does not establish any Redis connections yet -- connections are created
@@ -997,6 +1048,8 @@ impl WorkerBuilder {
             options: self.options,
             on_completed: self.on_completed,
             on_failed: self.on_failed,
+            on_active: self.on_active,
+            on_error: self.on_error,
             _phantom: PhantomData,
         }
     }
