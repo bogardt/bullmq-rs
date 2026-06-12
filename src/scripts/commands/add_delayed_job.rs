@@ -21,6 +21,7 @@ pub(crate) async fn add_delayed_job(
     opts_json: &str,
     max_events: u64,
     delayed_timestamp: u64,
+    dedup_key: &str,
 ) -> BullmqResult<String> {
     add_delayed_job_with_parent(
         loader,
@@ -35,6 +36,7 @@ pub(crate) async fn add_delayed_job(
         max_events,
         delayed_timestamp,
         None,
+        dedup_key,
     )
     .await
 }
@@ -54,6 +56,7 @@ pub(crate) async fn add_delayed_job_with_parent(
     max_events: u64,
     delayed_timestamp: u64,
     parent: Option<(&str, &str)>,
+    dedup_key: &str,
 ) -> BullmqResult<String> {
     let (parent_key, parent_data) = parent.unwrap_or(("", ""));
     let keys = vec![
@@ -74,6 +77,7 @@ pub(crate) async fn add_delayed_job_with_parent(
         delayed_timestamp.to_string().into_bytes(),
         parent_key.as_bytes().to_vec(),
         parent_data.as_bytes().to_vec(),
+        dedup_key.as_bytes().to_vec(),
     ];
     let result = loader.invoke("addDelayedJob", conn, &keys, &args).await?;
     match result {

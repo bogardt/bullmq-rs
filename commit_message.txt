@@ -1,0 +1,27 @@
+feat(queue): restore job deduplication (JobOptions.deduplication)
+
+Restore the dedup/debounce logic that had been stripped from the add-job
+Lua scripts relative to upstream BullMQ:
+
+- Add JobOptions.deduplication (DeduplicationOptions { id, ttl }),
+  serialized as "de" in the job opts JSON to match BullMQ's
+  optsEncodeMap wire format. Export DeduplicationOptions from lib.
+- New lua/includes/deduplicateJob.lua: SET <prefix>:de:<id> NX (with PX
+  when ttl is set); on conflict emits the upstream-compatible
+  "debounced" and "deduplicated" events and returns the existing job id
+  (replace/extend/keepLastIfActive modes remain stripped, as only
+  id/ttl are exposed).
+- addStandardJob-9 / addPrioritizedJob-9 / addDelayedJob-6 accept a new
+  trailing ARGV with the full deduplication key and short-circuit via
+  deduplicateJob before storing the job.
+- storeJob.lua stores the "deid" hash field like upstream.
+- New lua/includes/removeDeduplicationKeyIfNeededOnFinalization.lua
+  (verbatim upstream), wired into moveToFinished-14 so the dedup key is
+  cleared when the deduplicated job completes or fails.
+- Queue::add computes the dedup key, forwards it to the add wrappers
+  and returns a job carrying the EXISTING job's id when the add was
+  deduplicated, mirroring Node's Queue.add behavior.
+
+Integration tests cover: dedup returning the existing id, PTTL on the
+de: key, key removal on completion allowing a new add, and distinct
+dedup ids producing distinct jobs.

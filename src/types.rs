@@ -87,6 +87,28 @@ pub struct JobOptions {
     /// Custom job ID. Auto-generated if not provided.
     #[serde(rename = "jobId", skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
+    /// Deduplication options. Serialized as `de` to match the BullMQ wire format.
+    #[serde(rename = "de", skip_serializing_if = "Option::is_none", default)]
+    pub deduplication: Option<DeduplicationOptions>,
+}
+
+/// Job deduplication options.
+///
+/// While a deduplication key (`<prefix>:<queue>:de:<id>`) exists, further adds
+/// with the same `id` are deduplicated and return the existing job's ID.
+/// Without a `ttl`, the key lives until the deduplicated job completes or
+/// fails; with a `ttl`, it expires after that duration instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeduplicationOptions {
+    /// Identifier used to deduplicate jobs.
+    pub id: String,
+    /// Time-to-live for the deduplication key (in milliseconds).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "option_duration_millis",
+        default
+    )]
+    pub ttl: Option<Duration>,
 }
 
 /// Backoff strategy for job retries.

@@ -19,15 +19,17 @@
   ARGV[6] = maxEvents
   ARGV[7] = parentKey (optional)
   ARGV[8] = parent (optional)
+  ARGV[9] = deduplication key (optional, prefix:queueName:de:<dedupId>)
 
-  Returns: jobId
+  Returns: jobId (the existing job's id when the add is deduplicated)
 
-  Ported from BullMQ (stripped: parent/flow, dedup, repeat, debounce).
+  Ported from BullMQ (stripped: parent/flow, repeat).
 ]]
 local rcall = redis.call
 
 --@include "storeJob"
 --@include "addBaseMarkerIfNeeded"
+--@include "deduplicateJob"
 
 local waitKey = KEYS[1]
 local metaKey = KEYS[2]
@@ -45,6 +47,7 @@ local opts = cjson.decode(ARGV[5])
 local maxEvents = tonumber(ARGV[6]) or 10000
 local parentKey = ARGV[7]
 local parentData = ARGV[8]
+local deduplicationKey = ARGV[9]
 
 if parentKey == "" then
   parentKey = nil
@@ -52,10 +55,19 @@ end
 if parentData == "" then
   parentData = nil
 end
+if deduplicationKey == "" then
+  deduplicationKey = nil
+end
 
 -- Idempotent: if job hash already exists, return the jobId
 if rcall("EXISTS", jobIdKey) == 1 then
   return jobId
+end
+
+local deduplicationJobId = deduplicateJob(opts['de'], jobId, deduplicationKey,
+                                          eventsKey, maxEvents)
+if deduplicationJobId then
+  return deduplicationJobId
 end
 
 local delay, priority = storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp,

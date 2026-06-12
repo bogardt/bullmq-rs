@@ -3343,3 +3343,210 @@ async fn test_worker_is_running_and_is_paused_states() {
     assert!(!handle.is_running(), "worker is not running after shutdown");
     handle.wait().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Job deduplication
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_dedup_second_add_returns_existing_job_id() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let opts = JobOptions {
+        deduplication: Some(DeduplicationOptions {
+            id: "dedup-a".into(),
+            ttl: None,
+        }),
+        ..Default::default()
+    };
+
+    let first = queue
+        .add("dedup", TestJob { value: "v1".into() }, Some(opts.clone()))
+        .await
+        .unwrap();
+    let second = queue
+        .add("dedup", TestJob { value: "v2".into() }, Some(opts))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        second.id, first.id,
+        "second add returns the existing job id"
+    );
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
+
+    // The stored job keeps the first add's data and records the dedup id.
+    let stored = queue.get_job(&first.id).await.unwrap().unwrap();
+    assert_eq!(stored.data.value, "v1");
+
+    let mut conn = raw_redis_conn().await;
+    let deid: String = redis::cmd("HGET")
+        .arg(format!("bull:{}:{}", qname, first.id))
+        .arg("deid")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(deid, "dedup-a");
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_dedup_key_has_ttl() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .add(
+            "dedup",
+            TestJob { value: "v1".into() },
+            Some(JobOptions {
+                deduplication: Some(DeduplicationOptions {
+                    id: "dedup-ttl".into(),
+                    ttl: Some(Duration::from_secs(5)),
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut conn = raw_redis_conn().await;
+    let dedup_key = format!("bull:{}:de:dedup-ttl", qname);
+    let holder: String = redis::cmd("GET")
+        .arg(&dedup_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(holder, job.id);
+
+    let pttl: i64 = redis::cmd("PTTL")
+        .arg(&dedup_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        pttl > 0 && pttl <= 5000,
+        "dedup key PTTL should be set, got {}",
+        pttl
+    );
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_dedup_key_cleared_on_completion() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let opts = JobOptions {
+        deduplication: Some(DeduplicationOptions {
+            id: "dedup-complete".into(),
+            ttl: None,
+        }),
+        ..Default::default()
+    };
+
+    let first = queue
+        .add("dedup", TestJob { value: "v1".into() }, Some(opts.clone()))
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 1);
+
+    let mut raw = raw_redis_conn().await;
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg(format!("bull:{}:de:dedup-complete", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(exists, 0, "dedup key is removed when the job completes");
+
+    let second = queue
+        .add("dedup", TestJob { value: "v2".into() }, Some(opts))
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id, "a new job is created after completion");
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_dedup_different_ids_create_two_jobs() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let first = queue
+        .add(
+            "dedup",
+            TestJob { value: "v1".into() },
+            Some(JobOptions {
+                deduplication: Some(DeduplicationOptions {
+                    id: "dedup-x".into(),
+                    ttl: None,
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let second = queue
+        .add(
+            "dedup",
+            TestJob { value: "v2".into() },
+            Some(JobOptions {
+                deduplication: Some(DeduplicationOptions {
+                    id: "dedup-y".into(),
+                    ttl: None,
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(second.id, first.id);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 2);
+
+    queue.drain().await.unwrap();
+}
