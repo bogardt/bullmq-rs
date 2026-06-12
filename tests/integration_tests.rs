@@ -5165,3 +5165,482 @@ async fn test_queue_get_next_job() {
 
     queue.drain().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic rate limiting
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_manual_rate_limit_requeues_without_attempt() {
+    let qname = unique_queue_name();
+    let queue = Arc::new(
+        QueueBuilder::new(&qname)
+            .connection(redis_conn())
+            .build::<TestJob>()
+            .await
+            .unwrap(),
+    );
+
+    let job = queue
+        .add(
+            "limited",
+            TestJob {
+                value: "manual".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let limited_at = std::time::Instant::now();
+
+    let deliveries = Arc::new(AtomicU64::new(0));
+    let completed = Arc::new(AtomicU64::new(0));
+    let deliveries_cb = deliveries.clone();
+    let completed_cb = completed.clone();
+    let queue_cb = queue.clone();
+
+    // As in Node BullMQ, manual rate-limiting requires the worker to be
+    // configured with limiter options: the handler activates the limit via
+    // Queue::rate_limit, then returns the RateLimited marker error.
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .limiter(RateLimiterOptions {
+            max: 100,
+            duration: Duration::from_secs(1),
+        })
+        .build::<TestJob>();
+    let handle = worker
+        .start(move |_job| {
+            let deliveries = deliveries_cb.clone();
+            let completed = completed_cb.clone();
+            let queue = queue_cb.clone();
+            async move {
+                if deliveries.fetch_add(1, Ordering::SeqCst) == 0 {
+                    queue.rate_limit(Duration::from_secs(3)).await?;
+                    return Err(Box::new(BullmqError::RateLimited)
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    // After the first (rate-limited) delivery the job must be back in wait
+    // with attemptsMade untouched.
+    let mut raw = raw_redis_conn().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let wait_jobs: Vec<String> = redis::cmd("LRANGE")
+            .arg(format!("bull:{}:wait", qname))
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        if deliveries.load(Ordering::SeqCst) >= 1 && wait_jobs.contains(&job.id) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job should be back in wait after the manual rate-limit"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let attempts_made: u64 = redis::cmd("HGET")
+        .arg(format!("bull:{}:{}", qname, job.id))
+        .arg("atm")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(
+        attempts_made, 0,
+        "manual rate-limit must not consume an attempt"
+    );
+
+    // The job is redelivered once the limiter TTL expires and completes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while completed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job should complete after the rate-limit window"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        limited_at.elapsed() >= Duration::from_millis(2000),
+        "redelivery should wait for the limiter TTL, took {:?}",
+        limited_at.elapsed()
+    );
+    assert_eq!(deliveries.load(Ordering::SeqCst), 2);
+
+    let completed_attempts: u64 = redis::cmd("HGET")
+        .arg(format!("bull:{}:{}", qname, job.id))
+        .arg("atm")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(completed_attempts, 1);
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_rate_limit_blocks_fetching() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "limited",
+            TestJob {
+                value: "blocked".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    queue.rate_limit(Duration::from_secs(2)).await.unwrap();
+    let limited_at = std::time::Instant::now();
+
+    let completed = Arc::new(AtomicU64::new(0));
+    let completed_cb = completed.clone();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .limiter(RateLimiterOptions {
+            max: 100,
+            duration: Duration::from_secs(1),
+        })
+        .build::<TestJob>();
+    let handle = worker
+        .start(move |_job| {
+            let completed = completed_cb.clone();
+            async move {
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        0,
+        "worker must not fetch jobs while the queue is rate limited"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while completed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job should be processed after the rate-limit window"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        limited_at.elapsed() >= Duration::from_millis(1800),
+        "job processed too early: {:?}",
+        limited_at.elapsed()
+    );
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Dedup key purge on job removal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_remove_job_purges_dedup_key() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let opts = JobOptions {
+        deduplication: Some(DeduplicationOptions {
+            id: "purge-me".into(),
+            ttl: Some(Duration::from_secs(3600)),
+        }),
+        ..Default::default()
+    };
+
+    let first = queue
+        .add("dedup", TestJob { value: "v1".into() }, Some(opts.clone()))
+        .await
+        .unwrap();
+
+    let mut raw = raw_redis_conn().await;
+    let dedup_key = format!("bull:{}:de:purge-me", qname);
+    let owner: String = redis::cmd("GET")
+        .arg(&dedup_key)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(owner, first.id);
+
+    queue.remove(&first.id).await.unwrap();
+
+    let dedup_exists: bool = redis::cmd("EXISTS")
+        .arg(&dedup_key)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(!dedup_exists, "removing the job must purge its dedup key");
+    let job_exists: bool = redis::cmd("EXISTS")
+        .arg(format!("bull:{}:{}", qname, first.id))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(!job_exists);
+
+    // Re-adding with the same dedup id creates a NEW job.
+    let second = queue
+        .add("dedup", TestJob { value: "v2".into() }, Some(opts))
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id, "a new job must be created after purge");
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative cancellation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_cancel_job_cooperative_exit() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .add(
+            "cooperative",
+            TestJob {
+                value: "cancel-me".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let started = Arc::new(AtomicU64::new(0));
+    let exited = Arc::new(AtomicU64::new(0));
+    let started_cb = started.clone();
+    let exited_cb = exited.clone();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker
+        .start_with_signal(move |_job, token| {
+            let started = started_cb.clone();
+            let exited = exited_cb.clone();
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        exited.fetch_add(1, Ordering::SeqCst);
+                        Err("cancelled by signal".into())
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => Ok(()),
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while started.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 1, "handler should start");
+
+    let cancelled_at = std::time::Instant::now();
+    assert!(
+        handle.cancel_job(&job.id),
+        "cancel_job should signal the job"
+    );
+
+    // The handler observes the token and exits well within the grace period.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while exited.load(Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handler should exit cooperatively"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        cancelled_at.elapsed() < Duration::from_secs(2),
+        "cooperative exit should be fast, took {:?}",
+        cancelled_at.elapsed()
+    );
+
+    // The returned Err follows the normal failure path: job moves to failed
+    // (single attempt) and does not linger in active.
+    let mut raw = raw_redis_conn().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let failed: Option<f64> = redis::cmd("ZSCORE")
+            .arg(format!("bull:{}:failed", qname))
+            .arg(&job.id)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        if failed.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cancelled job should reach the failed set"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let active: Vec<String> = redis::cmd("LRANGE")
+        .arg(format!("bull:{}:active", qname))
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        !active.contains(&job.id),
+        "cancelled job must not be stuck in active"
+    );
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// on_error runtime coverage
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_on_error_fires_and_worker_recovers() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let completed = Arc::new(AtomicU64::new(0));
+    let errors_cb = errors.clone();
+    let completed_cb = completed.clone();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .on_error(move |_err| {
+            errors_cb.fetch_add(1, Ordering::SeqCst);
+        })
+        .build::<TestJob>();
+    let handle = worker
+        .start(move |_job| {
+            let completed = completed_cb.clone();
+            async move {
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    // Let the worker engage its blocking fetch, then kill every normal client
+    // (except this one): the worker's connections die mid-BZPOPMIN and the
+    // fetch loop reports the failure through on_error before reconnecting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut raw = raw_redis_conn().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while errors.load(Ordering::SeqCst) == 0 {
+        let _: i64 = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("TYPE")
+            .arg("normal")
+            .arg("SKIPME")
+            .arg("yes")
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "on_error should fire after the worker connections are killed"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(errors.load(Ordering::SeqCst) > 0);
+
+    // The ConnectionManager reconnects: the worker still processes new jobs.
+    // The first command after the kill may fail while the queue connection
+    // reconnects, so retry the add briefly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match queue
+            .add(
+                "after-kill",
+                TestJob {
+                    value: "recovered".into(),
+                },
+                None,
+            )
+            .await
+        {
+            Ok(_) => break,
+            Err(e) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "queue connection should reconnect after the kill: {}",
+                    e
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while completed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "worker should recover and process jobs after the connection kill"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}

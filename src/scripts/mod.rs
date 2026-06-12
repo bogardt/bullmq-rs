@@ -71,6 +71,8 @@ impl ScriptLoader {
         register!("getJobScheduler", "getJobScheduler-1.lua");
         register!("removeJobScheduler", "removeJobScheduler-3.lua");
         register!("extendLocks", "extendLocks-1.lua");
+        register!("moveJobFromActiveToWait", "moveJobFromActiveToWait-9.lua");
+        register!("removeJob", "removeJob-2.lua");
 
         Self { scripts }
     }
@@ -124,6 +126,10 @@ impl ScriptLoader {
             "removeDeduplicationKeyIfNeededOnRemoval.lua"
         );
         inc!("destructureJobKey", "destructureJobKey.lua");
+        inc!("pushBackJobWithPriority", "pushBackJobWithPriority.lua");
+        inc!("isLocked", "isLocked.lua");
+        inc!("removeJobFromAnyState", "removeJobFromAnyState.lua");
+        inc!("removeJobWithChildren", "removeJobWithChildren.lua");
         inc!("removeParentDependencyKey", "removeParentDependencyKey.lua");
         inc!("removeJob", "removeJob.lua");
         inc!("removeJobs", "removeJobs.lua");
@@ -238,6 +244,8 @@ mod tests {
         assert!(loader.scripts.contains_key("getJobScheduler"));
         assert!(loader.scripts.contains_key("removeJobScheduler"));
         assert!(loader.scripts.contains_key("extendLocks"));
-        assert_eq!(loader.scripts.len(), 23);
+        assert!(loader.scripts.contains_key("moveJobFromActiveToWait"));
+        assert!(loader.scripts.contains_key("removeJob"));
+        assert_eq!(loader.scripts.len(), 25);
     }
 }

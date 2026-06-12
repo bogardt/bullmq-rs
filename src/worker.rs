@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::{watch, Mutex, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::connection::RedisConnection;
 use crate::error::{BullmqError, BullmqResult};
@@ -21,17 +22,20 @@ type ActiveCallback = Arc<dyn Fn(&Job<serde_json::Value>) + Send + Sync>;
 /// Type alias for the on_error callback.
 type ErrorCallback = Arc<dyn Fn(&BullmqError) + Send + Sync>;
 use crate::scripts::commands::{
-    extend_lock, move_stalled_jobs_to_wait, move_to_active, move_to_delayed, move_to_finished,
-    update_job_scheduler,
+    extend_lock, move_job_from_active_to_wait, move_stalled_jobs_to_wait, move_to_active,
+    move_to_delayed, move_to_finished, update_job_scheduler,
 };
 use crate::scripts::ScriptLoader;
 use crate::types::{MetricsOptions, RateLimiterOptions, WorkerOptions, DEFAULT_MAX_EVENTS};
 
 const MARKER_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_CONN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
+/// Grace period granted to a cancelled handler to exit cooperatively before
+/// its future is dropped.
+const CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
-/// Registry of cancellation signals for in-flight jobs, keyed by job id.
-type Cancellations = Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
+/// Registry of cancellation tokens for in-flight jobs, keyed by job id.
+type Cancellations = Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>;
 
 /// A worker that processes jobs from a queue.
 ///
@@ -84,6 +88,8 @@ pub struct WorkerHandle {
     concurrency: usize,
     prefetched: Arc<std::sync::atomic::AtomicUsize>,
     cancellations: Cancellations,
+    conn: redis::aio::ConnectionManager,
+    limiter_key: String,
     join_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -131,29 +137,51 @@ impl WorkerHandle {
         !*self.shutdown_tx.borrow() && !self.join_handle.is_finished()
     }
 
-    /// Cancel an in-flight job by aborting its processing future.
+    /// Cancel an in-flight job, cooperatively first.
     ///
     /// Returns `true` when the job was being processed by this worker and the
     /// cancellation signal was delivered, `false` otherwise (unknown job id or
     /// already finished).
     ///
-    /// Unlike Node BullMQ — where cancellation is cooperative via an
-    /// `AbortSignal` passed to the processor — the handler future is dropped
-    /// at its next await point and gets no chance to clean up. The job is NOT
-    /// moved to a finished state: it stays in the active list with its lock,
-    /// the lock then expires (this worker stops extending it), and the
-    /// stalled-job checker eventually requeues or fails it according to
-    /// `max_stalled_count`.
+    /// The job's [`CancellationToken`] is triggered first: handlers started
+    /// with [`Worker::start_with_signal`] can observe it (e.g. via
+    /// `tokio::select!` on `token.cancelled()`) and return promptly — a
+    /// returned `Err` follows the normal retry/fail path, an `Ok` completes
+    /// the job. If the handler has not finished after a 5-second grace
+    /// period (always the case for [`Worker::start`] handlers, which never
+    /// see the token), its future is dropped at the next await point with no
+    /// chance to clean up. In that case the job is NOT moved to a finished
+    /// state: it stays in the active list with its lock, the lock then
+    /// expires (this worker stops extending it), and the stalled-job checker
+    /// eventually requeues or fails it according to `max_stalled_count`.
     pub fn cancel_job(&self, job_id: &str) -> bool {
-        let sender = self
+        let token = self
             .cancellations
             .lock()
             .expect("cancellations mutex poisoned")
             .remove(job_id);
-        match sender {
-            Some(tx) => tx.send(()).is_ok(),
+        match token {
+            Some(token) => {
+                token.cancel();
+                true
+            }
             None => false,
         }
+    }
+
+    /// Overrides the rate limit to be active for the next jobs, with the same
+    /// effect as [`Queue::rate_limit`](crate::Queue::rate_limit) (parity with
+    /// Node `worker.rateLimit()`).
+    pub async fn rate_limit(&self, duration: Duration) -> BullmqResult<()> {
+        let mut conn = self.conn.clone();
+        redis::cmd("SET")
+            .arg(&self.limiter_key)
+            .arg(crate::queue::MAX_SAFE_INTEGER)
+            .arg("PX")
+            .arg(duration.as_millis() as u64)
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(())
     }
 
     /// Signal the worker to stop after finishing current jobs.
@@ -183,12 +211,31 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
     ///
     /// The handler receives a `Job<T>` and must return a `Result<(), Box<dyn Error>>`.
     /// On success the job moves to completed; on error it is retried (if attempts
-    /// remain) or moved to failed.
+    /// remain) or moved to failed. Returning `Box::new(BullmqError::RateLimited)`
+    /// moves the job back to wait without consuming an attempt (mirrors Node
+    /// `Worker.RateLimitError()`).
     ///
     /// Returns a [`WorkerHandle`] that can be used to shut down the worker.
     pub async fn start<F, Fut>(self, handler: F) -> BullmqResult<WorkerHandle>
     where
         F: Fn(Job<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+    {
+        self.start_with_signal(move |job, _signal| handler(job))
+            .await
+    }
+
+    /// Start processing jobs with a handler that also receives a
+    /// [`CancellationToken`] for cooperative cancellation.
+    ///
+    /// The token is cancelled by [`WorkerHandle::cancel_job`]; handlers can
+    /// observe it (e.g. `tokio::select!` on `token.cancelled()`) and return
+    /// early. A returned `Err` follows the normal retry/fail path; if the
+    /// handler ignores the token, its future is dropped after a 5-second
+    /// grace period (see [`WorkerHandle::cancel_job`]).
+    pub async fn start_with_signal<F, Fut>(self, handler: F) -> BullmqResult<WorkerHandle>
+    where
+        F: Fn(Job<T>, CancellationToken) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
     {
         // Create two independent ConnectionManager instances.
@@ -214,6 +261,10 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         // fast-path channel, already active in Redis but not yet picked up).
         let (paused_tx, paused_rx) = watch::channel(false);
         let prefetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Epoch ms until which fetching is suspended after a manual
+        // rate-limit (mirrors Node worker.limitUntil).
+        let limit_until = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let handler = Arc::new(handler);
         let semaphore = Arc::new(Semaphore::new(self.options.concurrency));
@@ -241,6 +292,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         let semaphore_handle = semaphore.clone();
         let prefetched_handle = prefetched.clone();
         let cancellations_handle = cancellations.clone();
+        let handle_conn = cmd_conn.clone();
+        let limiter_key = format!("{}:{}:limiter", prefix, name);
 
         let join_handle = tokio::spawn({
             let scripts = scripts.clone();
@@ -252,6 +305,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             let shutdown_rx_main = shutdown_rx.clone();
             let paused_rx_main = paused_rx.clone();
             let prefetched = prefetched.clone();
+            let limit_until = limit_until.clone();
 
             // Spawn the lock extender background task.
             let lock_extender_handle = {
@@ -401,6 +455,18 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                         }
                         continue;
                     } else {
+                        // Honor a manual rate limit before fetching.
+                        let limited_until = limit_until.load(std::sync::atomic::Ordering::SeqCst);
+                        let now = now_ms();
+                        if limited_until > now {
+                            let wait_ms = (limited_until - now).min(30_000);
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {},
+                                _ = shutdown_rx.changed() => break,
+                            }
+                            continue;
+                        }
+
                         // BZPOPMIN on the marker key with 5-second timeout.
                         let bzpopmin_result: redis::RedisResult<redis::Value> =
                             redis::cmd("BZPOPMIN")
@@ -673,6 +739,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             let task_paused_rx = paused_rx.clone();
                             let task_prefetched = prefetched.clone();
                             let task_cancellations = cancellations.clone();
+                            let task_limit_until = limit_until.clone();
 
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -692,16 +759,25 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                 }
 
                                 // Run the user handler, racing it against a
-                                // cancellation signal (see WorkerHandle::cancel_job).
-                                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                                // cancellation token (see WorkerHandle::cancel_job).
+                                // On cancellation the handler gets a grace
+                                // period to exit cooperatively before its
+                                // future is dropped.
+                                let cancel_token = CancellationToken::new();
                                 task_cancellations
                                     .lock()
                                     .expect("cancellations mutex poisoned")
-                                    .insert(job_id.clone(), cancel_tx);
+                                    .insert(job_id.clone(), cancel_token.clone());
 
+                                let handler_fut = handler(job.clone(), cancel_token.clone());
+                                tokio::pin!(handler_fut);
                                 let handler_outcome = tokio::select! {
-                                    res = handler(job.clone()) => Some(res),
-                                    _ = cancel_rx => None,
+                                    res = &mut handler_fut => Some(res),
+                                    _ = cancel_token.cancelled() => {
+                                        tokio::time::timeout(CANCEL_GRACE_PERIOD, &mut handler_fut)
+                                            .await
+                                            .ok()
+                                    }
                                 };
 
                                 task_cancellations
@@ -811,6 +887,48 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         }
 
                                         tracing::debug!("Job {} completed", job_id);
+                                    }
+                                    Some(Err(err))
+                                        if err
+                                            .downcast_ref::<BullmqError>()
+                                            .map(|e| matches!(e, BullmqError::RateLimited))
+                                            .unwrap_or(false) =>
+                                    {
+                                        // Manual rate-limit: move the job back to
+                                        // wait without consuming an attempt and
+                                        // suspend fetching for the limiter TTL
+                                        // (mirrors Node moveLimitedBackToWait).
+                                        match move_job_from_active_to_wait::move_job_from_active_to_wait(
+                                            &scripts,
+                                            &mut task_conn,
+                                            &task_prefix,
+                                            &task_name,
+                                            &job_id,
+                                            &task_token,
+                                        )
+                                        .await
+                                        {
+                                            Ok(ttl) => {
+                                                if ttl > 0 {
+                                                    task_limit_until.store(
+                                                        now_ms() + ttl,
+                                                        std::sync::atomic::Ordering::SeqCst,
+                                                    );
+                                                }
+                                                tracing::debug!(
+                                                    "Job {} manually rate limited, moved back to wait (limiter ttl {} ms)",
+                                                    job_id,
+                                                    ttl
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "Error moving rate-limited job {} back to wait: {}",
+                                                    job_id,
+                                                    e
+                                                );
+                                            }
+                                        }
                                     }
                                     Some(Err(err)) => {
                                         let new_attempts = job.attempts_made + 1;
@@ -986,6 +1104,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             concurrency,
             prefetched: prefetched_handle,
             cancellations: cancellations_handle,
+            conn: handle_conn,
+            limiter_key,
             join_handle,
         })
     }
