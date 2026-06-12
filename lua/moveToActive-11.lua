@@ -6,7 +6,7 @@
   KEYS[3]  = prioritized sorted set
   KEYS[4]  = events stream
   KEYS[5]  = stalled set
-  KEYS[6]  = limiter key (unused in this simplified port)
+  KEYS[6]  = rate limiter key
   KEYS[7]  = delayed sorted set
   KEYS[8]  = paused list
   KEYS[9]  = meta hash
@@ -18,11 +18,14 @@
   ARGV[3] = timestamp (current time ms)
   ARGV[4] = maxEvents
   ARGV[5] = jobKeyPrefix (e.g. "bull:queueName:")
+  ARGV[6] = rate limiter max jobs ("" when no limiter)
+  ARGV[7] = rate limiter duration in milliseconds ("" when no limiter)
 
   Returns:
     Array with [jobId, jobData...] on success, or nil/0 if no jobs.
+    When rate limited: {0, 0, rateLimitedNextTtl, 0}.
 
-  Ported from BullMQ (stripped: rate limiter, groups, parent/flow).
+  Ported from BullMQ (stripped: groups, parent/flow).
 ]]
 local rcall = redis.call
 
@@ -30,6 +33,7 @@ local rcall = redis.call
 --@include "getPriorityScore"
 --@include "getDelayedScore"
 --@include "addDelayMarkerIfNeeded"
+--@include "getRateLimitTTL"
 --@include "promoteDelayedJobs"
 
 local waitKey = KEYS[1]
@@ -37,7 +41,7 @@ local activeKey = KEYS[2]
 local prioritizedKey = KEYS[3]
 local eventsKey = KEYS[4]
 local stalledKey = KEYS[5]
--- local limiterKey = KEYS[6]
+local rateLimiterKey = KEYS[6]
 local delayedKey = KEYS[7]
 local pausedKey = KEYS[8]
 local metaKey = KEYS[9]
@@ -49,11 +53,19 @@ local lockDuration = tonumber(ARGV[2])
 local timestamp = tonumber(ARGV[3])
 local maxEvents = tonumber(ARGV[4]) or 10000
 local jobKeyPrefix = ARGV[5]
+local maxJobs = tonumber(ARGV[6])
+local limiterDuration = tonumber(ARGV[7])
 
 -- 1. Promote any delayed jobs that are ready
 local isPaused = rcall("HEXISTS", metaKey, "paused") == 1
 promoteDelayedJobs(delayedKey, markerKey, waitKey, prioritizedKey,
                    eventsKey, jobKeyPrefix, timestamp, pcKey, isPaused)
+
+-- Check if we are rate limited first.
+local expireTime = getRateLimitTTL(maxJobs, rateLimiterKey)
+if expireTime > 0 then
+  return {0, 0, expireTime, 0}
+end
 
 if isPaused then
   return nil
@@ -81,6 +93,15 @@ end
 -- 5. We have a job — acquire lock and set active state
 local jobKey = jobKeyPrefix .. jobId
 local lockKey = jobKey .. ":lock"
+
+-- Check if we need to perform rate limiting.
+if maxJobs then
+  local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
+  if jobCounter == 1 then
+    local integerDuration = math.floor(math.abs(limiterDuration))
+    rcall("PEXPIRE", rateLimiterKey, integerDuration)
+  end
+end
 
 -- Set lock with token and expiry
 rcall("SET", lockKey, token, "PX", lockDuration)

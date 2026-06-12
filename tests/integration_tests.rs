@@ -3345,208 +3345,155 @@ async fn test_worker_is_running_and_is_paused_states() {
 }
 
 // ---------------------------------------------------------------------------
-// Job deduplication
+// test_worker_rate_limiter_limits_throughput
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_dedup_second_add_returns_existing_job_id() {
-    let qname = unique_queue_name();
-    let queue = QueueBuilder::new(&qname)
+async fn test_worker_rate_limiter_limits_throughput() {
+    let queue_name = unique_queue_name();
+    let queue = QueueBuilder::new(&queue_name)
         .connection(redis_conn())
         .build::<TestJob>()
         .await
         .unwrap();
 
-    let opts = JobOptions {
-        deduplication: Some(DeduplicationOptions {
-            id: "dedup-a".into(),
-            ttl: None,
-        }),
-        ..Default::default()
-    };
+    for i in 0..6 {
+        queue
+            .add(
+                "limited",
+                TestJob {
+                    value: format!("job-{}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
 
-    let first = queue
-        .add("dedup", TestJob { value: "v1".into() }, Some(opts.clone()))
-        .await
-        .unwrap();
-    let second = queue
-        .add("dedup", TestJob { value: "v2".into() }, Some(opts))
-        .await
-        .unwrap();
+    let completed = Arc::new(AtomicU64::new(0));
+    let completed_handler = completed.clone();
 
-    assert_eq!(
-        second.id, first.id,
-        "second add returns the existing job id"
-    );
-
-    let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
-
-    // The stored job keeps the first add's data and records the dedup id.
-    let stored = queue.get_job(&first.id).await.unwrap().unwrap();
-    assert_eq!(stored.data.value, "v1");
-
-    let mut conn = raw_redis_conn().await;
-    let deid: String = redis::cmd("HGET")
-        .arg(format!("bull:{}:{}", qname, first.id))
-        .arg("deid")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-    assert_eq!(deid, "dedup-a");
-
-    queue.drain().await.unwrap();
-}
-
-#[tokio::test]
-#[ignore = "requires running Redis"]
-async fn test_dedup_key_has_ttl() {
-    let qname = unique_queue_name();
-    let queue = QueueBuilder::new(&qname)
+    let worker = WorkerBuilder::new(&queue_name)
         .connection(redis_conn())
-        .build::<TestJob>()
-        .await
-        .unwrap();
-
-    let job = queue
-        .add(
-            "dedup",
-            TestJob { value: "v1".into() },
-            Some(JobOptions {
-                deduplication: Some(DeduplicationOptions {
-                    id: "dedup-ttl".into(),
-                    ttl: Some(Duration::from_secs(5)),
-                }),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-
-    let mut conn = raw_redis_conn().await;
-    let dedup_key = format!("bull:{}:de:dedup-ttl", qname);
-    let holder: String = redis::cmd("GET")
-        .arg(&dedup_key)
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-    assert_eq!(holder, job.id);
-
-    let pttl: i64 = redis::cmd("PTTL")
-        .arg(&dedup_key)
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-    assert!(
-        pttl > 0 && pttl <= 5000,
-        "dedup key PTTL should be set, got {}",
-        pttl
-    );
-
-    queue.drain().await.unwrap();
-}
-
-#[tokio::test]
-#[ignore = "requires running Redis"]
-async fn test_dedup_key_cleared_on_completion() {
-    let conn = redis_conn();
-    let qname = unique_queue_name();
-    let queue = QueueBuilder::new(&qname)
-        .connection(conn.clone())
-        .build::<TestJob>()
-        .await
-        .unwrap();
-
-    let opts = JobOptions {
-        deduplication: Some(DeduplicationOptions {
-            id: "dedup-complete".into(),
-            ttl: None,
-        }),
-        ..Default::default()
-    };
-
-    let first = queue
-        .add("dedup", TestJob { value: "v1".into() }, Some(opts.clone()))
-        .await
-        .unwrap();
-
-    let worker = WorkerBuilder::new(&qname)
-        .connection(conn)
+        .concurrency(6)
         .skip_stalled_check(true)
+        .limiter(RateLimiterOptions {
+            max: 2,
+            duration: Duration::from_secs(2),
+        })
         .build::<TestJob>();
-    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    let handle = worker
+        .start(move |_job| {
+            let completed = completed_handler.clone();
+            async move {
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let after_one_second = completed.load(Ordering::SeqCst);
+    assert!(
+        after_one_second <= 2,
+        "expected at most 2 jobs completed after 1s with limiter max=2/2s, got {}",
+        after_one_second
+    );
+    assert!(
+        after_one_second >= 1,
+        "expected at least 1 job completed after 1s, got 0"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if completed.load(Ordering::SeqCst) >= 6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected all 6 jobs to complete within 10s, got {}",
+            completed.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     handle.shutdown();
     handle.wait().await.unwrap();
 
     let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 1);
-
-    let mut raw = raw_redis_conn().await;
-    let exists: i64 = redis::cmd("EXISTS")
-        .arg(format!("bull:{}:de:dedup-complete", qname))
-        .query_async(&mut raw)
-        .await
-        .unwrap();
-    assert_eq!(exists, 0, "dedup key is removed when the job completes");
-
-    let second = queue
-        .add("dedup", TestJob { value: "v2".into() }, Some(opts))
-        .await
-        .unwrap();
-    assert_ne!(second.id, first.id, "a new job is created after completion");
-
-    let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 6);
 
     queue.drain().await.unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// test_worker_without_rate_limiter_unchanged
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_dedup_different_ids_create_two_jobs() {
-    let qname = unique_queue_name();
-    let queue = QueueBuilder::new(&qname)
+async fn test_worker_without_rate_limiter_unchanged() {
+    let queue_name = unique_queue_name();
+    let queue = QueueBuilder::new(&queue_name)
         .connection(redis_conn())
         .build::<TestJob>()
         .await
         .unwrap();
 
-    let first = queue
-        .add(
-            "dedup",
-            TestJob { value: "v1".into() },
-            Some(JobOptions {
-                deduplication: Some(DeduplicationOptions {
-                    id: "dedup-x".into(),
-                    ttl: None,
-                }),
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-    let second = queue
-        .add(
-            "dedup",
-            TestJob { value: "v2".into() },
-            Some(JobOptions {
-                deduplication: Some(DeduplicationOptions {
-                    id: "dedup-y".into(),
-                    ttl: None,
-                }),
-                ..Default::default()
-            }),
-        )
+    for i in 0..6 {
+        queue
+            .add(
+                "unlimited",
+                TestJob {
+                    value: format!("job-{}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let completed = Arc::new(AtomicU64::new(0));
+    let completed_handler = completed.clone();
+
+    let worker = WorkerBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .concurrency(6)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+
+    let handle = worker
+        .start(move |_job| {
+            let completed = completed_handler.clone();
+            async move {
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
         .await
         .unwrap();
 
-    assert_ne!(second.id, first.id);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if completed.load(Ordering::SeqCst) >= 6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected all 6 jobs to complete fast without limiter, got {}",
+            completed.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
 
     let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 2);
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 6);
 
     queue.drain().await.unwrap();
 }

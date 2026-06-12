@@ -2,9 +2,10 @@ use redis::aio::ConnectionManager;
 
 use crate::error::{BullmqError, BullmqResult};
 use crate::scripts::ScriptLoader;
+use crate::types::RateLimiterOptions;
 
 use super::key;
-use super::move_to_active::{parse_move_to_active_result, MoveToActiveResult};
+use super::move_to_active::{limiter_args, parse_move_to_active_result, MoveToActiveResult};
 
 /// Result of a moveToFinished call.
 #[derive(Debug)]
@@ -34,7 +35,7 @@ pub(crate) async fn move_to_finished(
     fetch_next: bool,
     lock_duration: u64,
     attempts_made: u32,
-    max_metrics_size: Option<u64>,
+    limiter: Option<&RateLimiterOptions>,
 ) -> BullmqResult<MoveToFinishedResult> {
     let job_key = format!("{}:{}:{}", prefix, queue_name, job_id);
     let lock_key = format!("{}:lock", job_key);
@@ -58,6 +59,7 @@ pub(crate) async fn move_to_finished(
         job_key,
         lock_key,
     ];
+    let (limiter_max, limiter_duration) = limiter_args(limiter);
     let args: Vec<Vec<u8>> = vec![
         token.as_bytes().to_vec(),
         timestamp.to_string().into_bytes(),
@@ -73,10 +75,8 @@ pub(crate) async fn move_to_finished(
         job_id.as_bytes().to_vec(),
         attempts_made.to_string().into_bytes(),
         job_key_prefix.into_bytes(),
-        max_metrics_size
-            .map(|n| n.to_string())
-            .unwrap_or_default()
-            .into_bytes(),
+        limiter_max,
+        limiter_duration,
     ];
 
     let result = loader.invoke("moveToFinished", conn, &keys, &args).await?;

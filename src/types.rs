@@ -143,35 +143,16 @@ impl BackoffStrategy {
     }
 }
 
-/// Options for collecting queue metrics while processing jobs.
+/// Rate limiter options for a worker.
 ///
-/// Mirrors BullMQ's `WorkerOptions.metrics` — when set, the worker records
-/// per-minute job counts under the `metrics:<state>` keys.
-#[derive(Debug, Clone)]
-pub struct MetricsOptions {
-    /// Maximum number of per-minute data points to retain.
-    pub max_data_points: u64,
-}
-
-/// Queue metrics for a finished state, as returned by [`crate::Queue::get_metrics`].
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Metrics {
-    pub meta: MetricsMeta,
-    /// Job counts per minute, newest first.
-    pub data: Vec<i64>,
-    /// Total number of data points stored.
-    pub count: u64,
-}
-
-/// Metadata stored alongside queue metrics.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct MetricsMeta {
-    /// Total number of finished jobs counted.
-    pub count: u64,
-    /// Timestamp (ms) of the last recorded data point.
-    pub prev_ts: u64,
-    /// Job count at the last recorded data point.
-    pub prev_count: u64,
+/// Limits the number of jobs moved to active per `duration` window, matching
+/// the BullMQ Node.js `limiter` worker option (shared `limiter` key in Redis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimiterOptions {
+    /// Maximum number of jobs processed per window.
+    pub max: u64,
+    /// Length of the rate-limit window.
+    pub duration: Duration,
 }
 
 /// Options for creating a worker.
@@ -187,8 +168,8 @@ pub struct WorkerOptions {
     pub max_stalled_count: u32,
     /// Whether to skip the stalled-job check entirely. Default is false.
     pub skip_stalled_check: bool,
-    /// Metrics collection options. Default is `None` (metrics disabled).
-    pub metrics: Option<MetricsOptions>,
+    /// Rate limiter: max jobs per duration window. Default is `None` (no limit).
+    pub limiter: Option<RateLimiterOptions>,
 }
 
 impl Default for WorkerOptions {
@@ -199,7 +180,7 @@ impl Default for WorkerOptions {
             stalled_interval: Duration::from_secs(30),
             max_stalled_count: 1,
             skip_stalled_check: false,
-            metrics: None,
+            limiter: None,
         }
     }
 }

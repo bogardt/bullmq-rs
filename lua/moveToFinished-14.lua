@@ -6,7 +6,7 @@
   KEYS[3]  = prioritized sorted set
   KEYS[4]  = events stream
   KEYS[5]  = stalled set
-  KEYS[6]  = limiter key (unused)
+  KEYS[6]  = rate limiter key
   KEYS[7]  = delayed sorted set
   KEYS[8]  = paused list
   KEYS[9]  = finished set (completed or failed sorted set)
@@ -26,14 +26,16 @@
   ARGV[8]  = jobId
   ARGV[9]  = attempts made
   ARGV[10] = jobKeyPrefix (e.g. "bull:queueName:")
-  ARGV[11] = maxMetricsSize ("" disables metrics collection)
+  ARGV[11] = rate limiter max jobs ("" when no limiter)
+  ARGV[12] = rate limiter duration in milliseconds ("" when no limiter)
 
   Returns:
     On error: negative integer (-1 = missing job, -2 = missing lock, -6 = token mismatch)
     On success without fetchNext: 0
     On success with fetchNext: array [nextJobId, nextJobData...] or 0
+    When rate limited during fetchNext: {0, 0, rateLimitedNextTtl, 0}
 
-  Ported from BullMQ (stripped: rate limiter, groups).
+  Ported from BullMQ (stripped: groups, metrics).
 ]]
 local rcall = redis.call
 
@@ -47,6 +49,7 @@ local rcall = redis.call
 --@include "getPriorityScore"
 --@include "getDelayedScore"
 --@include "addDelayMarkerIfNeeded"
+--@include "getRateLimitTTL"
 --@include "moveParentToWait"
 --@include "moveParentToWaitIfNeeded"
 --@include "moveParentToWaitIfNoPendingDependencies"
@@ -59,7 +62,7 @@ local activeKey = KEYS[2]
 local prioritizedKey = KEYS[3]
 local eventsKey = KEYS[4]
 local stalledKey = KEYS[5]
--- local limiterKey = KEYS[6]
+local rateLimiterKey = KEYS[6]
 local delayedKey = KEYS[7]
 local pausedKey = KEYS[8]
 local finishedKey = KEYS[9]
@@ -79,7 +82,8 @@ local lockDuration = tonumber(ARGV[7])
 local jobId = ARGV[8]
 local attemptsMade = ARGV[9]
 local jobKeyPrefix = ARGV[10]
-local maxMetricsSize = ARGV[11] or ""
+local maxJobs = tonumber(ARGV[11])
+local limiterDuration = tonumber(ARGV[12])
 
 -- 1. Check the job still exists
 if rcall("EXISTS", jobKey) ~= 1 then
@@ -162,6 +166,12 @@ if fetchNext == 1 then
   promoteDelayedJobs(delayedKey, markerKey, waitKey, prioritizedKey,
                      eventsKey, jobKeyPrefix, timestamp, pcKey, isPaused)
 
+  -- Check if we are rate limited first.
+  local expireTime = getRateLimitTTL(maxJobs, rateLimiterKey)
+  if expireTime > 0 then
+    return {0, 0, expireTime, 0}
+  end
+
   if isPaused then
     return 0
   end
@@ -186,6 +196,15 @@ if fetchNext == 1 then
   -- Acquire lock on next job
   local nextJobKey = jobKeyPrefix .. nextJobId
   local nextLockKey = nextJobKey .. ":lock"
+
+  -- Check if we need to perform rate limiting.
+  if maxJobs then
+    local jobCounter = tonumber(rcall("INCR", rateLimiterKey))
+    if jobCounter == 1 then
+      local integerDuration = math.floor(math.abs(limiterDuration))
+      rcall("PEXPIRE", rateLimiterKey, integerDuration)
+    end
+  end
 
   rcall("SET", nextLockKey, token, "PX", lockDuration)
   rcall("SADD", stalledKey, nextJobId)
