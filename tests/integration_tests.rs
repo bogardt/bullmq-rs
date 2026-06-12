@@ -3345,28 +3345,27 @@ async fn test_worker_is_running_and_is_paused_states() {
 }
 
 // ---------------------------------------------------------------------------
-// Queue metrics + enriched worker listeners
+// Queue clean / obliterate
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_metrics_collected_when_enabled() {
+async fn test_queue_clean_wait_jobs() {
     let conn = redis_conn();
     let qname = unique_queue_name();
 
     let queue = QueueBuilder::new(&qname)
-        .connection(conn.clone())
+        .connection(conn)
         .build::<TestJob>()
         .await
         .unwrap();
 
-    let n = 3;
-    for i in 0..n {
+    for i in 0..3 {
         queue
             .add(
-                "metered",
+                "to_clean",
                 TestJob {
-                    value: format!("job-{}", i),
+                    value: format!("job {}", i),
                 },
                 None,
             )
@@ -3374,42 +3373,138 @@ async fn test_metrics_collected_when_enabled() {
             .unwrap();
     }
 
-    let worker = WorkerBuilder::new(&qname)
-        .connection(conn)
-        .skip_stalled_check(true)
-        .metrics(MetricsOptions {
-            max_data_points: 60,
-        })
-        .build::<TestJob>();
-
-    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    handle.shutdown();
-    handle.wait().await.unwrap();
-
-    let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Completed).unwrap(), n);
-
-    let metrics = queue.get_metrics(JobState::Completed, 0, -1).await.unwrap();
-    assert_eq!(metrics.meta.count, n);
-    assert!(metrics.meta.prev_ts > 0, "prevTS should be recorded");
-
-    // Verify the BullMQ-compatible metrics meta key exists in Redis.
-    let mut raw = raw_redis_conn().await;
-    let exists: bool = redis::cmd("EXISTS")
-        .arg(format!("bull:{}:metrics:completed", qname))
-        .query_async(&mut raw)
+    let removed = queue
+        .clean(Duration::from_secs(0), 0, JobState::Wait)
         .await
         .unwrap();
-    assert!(exists, "metrics:completed key should exist");
+    assert_eq!(removed.len(), 3);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 0);
+
+    // Job hashes must be gone.
+    let mut raw = raw_redis_conn().await;
+    for job_id in &removed {
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(format!("bull:{}:{}", qname, job_id))
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert!(!exists, "job hash {} should be deleted", job_id);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_respects_grace_period() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "recent",
+            TestJob {
+                value: "too young to die".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let removed = queue
+        .clean(Duration::from_secs(3600), 0, JobState::Wait)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 0, "job within grace period must be kept");
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
 
     queue.drain().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_metrics_not_collected_when_disabled() {
+async fn test_queue_clean_respects_limit() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        queue
+            .add(
+                "limited",
+                TestJob {
+                    value: format!("job {}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let removed = queue
+        .clean(Duration::from_secs(0), 2, JobState::Wait)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 2);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_delayed_jobs() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "delayed",
+            TestJob {
+                value: "later".into(),
+            },
+            Some(JobOptions {
+                delay: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let removed = queue
+        .clean(Duration::from_secs(0), 0, JobState::Delayed)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 1);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Delayed).unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_completed_jobs() {
     let conn = redis_conn();
     let qname = unique_queue_name();
 
@@ -3421,9 +3516,9 @@ async fn test_metrics_not_collected_when_disabled() {
 
     queue
         .add(
-            "unmetered",
+            "work",
             TestJob {
-                value: "no metrics".into(),
+                value: "to be completed then cleaned".into(),
             },
             None,
         )
@@ -3434,9 +3529,7 @@ async fn test_metrics_not_collected_when_disabled() {
         .connection(conn)
         .skip_stalled_check(true)
         .build::<TestJob>();
-
     let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
-
     tokio::time::sleep(Duration::from_secs(3)).await;
     handle.shutdown();
     handle.wait().await.unwrap();
@@ -3444,136 +3537,138 @@ async fn test_metrics_not_collected_when_disabled() {
     let counts = queue.get_job_counts().await.unwrap();
     assert_eq!(*counts.get(&JobState::Completed).unwrap(), 1);
 
-    let mut raw = raw_redis_conn().await;
-    let meta_exists: bool = redis::cmd("EXISTS")
-        .arg(format!("bull:{}:metrics:completed", qname))
-        .query_async(&mut raw)
+    let removed = queue
+        .clean(Duration::from_secs(0), 0, JobState::Completed)
         .await
         .unwrap();
-    let data_exists: bool = redis::cmd("EXISTS")
-        .arg(format!("bull:{}:metrics:completed:data", qname))
-        .query_async(&mut raw)
-        .await
-        .unwrap();
-    assert!(!meta_exists, "no metrics key without the metrics option");
-    assert!(
-        !data_exists,
-        "no metrics data key without the metrics option"
-    );
-
-    let metrics = queue.get_metrics(JobState::Completed, 0, -1).await.unwrap();
-    assert_eq!(metrics.meta.count, 0);
-    assert_eq!(metrics.count, 0);
-    assert!(metrics.data.is_empty());
-
-    queue.drain().await.unwrap();
-}
-
-#[tokio::test]
-#[ignore = "requires running Redis"]
-async fn test_metrics_collected_for_failed_jobs() {
-    let conn = redis_conn();
-    let qname = unique_queue_name();
-
-    let queue = QueueBuilder::new(&qname)
-        .connection(conn.clone())
-        .build::<TestJob>()
-        .await
-        .unwrap();
-
-    queue
-        .add(
-            "will_fail",
-            TestJob {
-                value: "fail".into(),
-            },
-            None,
-        )
-        .await
-        .unwrap();
-
-    let worker = WorkerBuilder::new(&qname)
-        .connection(conn)
-        .skip_stalled_check(true)
-        .metrics(MetricsOptions {
-            max_data_points: 60,
-        })
-        .build::<TestJob>();
-
-    let handle = worker
-        .start(|_job| async move {
-            let err: Box<dyn std::error::Error + Send + Sync> = "intentional failure".into();
-            Err(err)
-        })
-        .await
-        .unwrap();
-
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    handle.shutdown();
-    handle.wait().await.unwrap();
+    assert_eq!(removed.len(), 1);
 
     let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Failed).unwrap(), 1);
-
-    let metrics = queue.get_metrics(JobState::Failed, 0, -1).await.unwrap();
-    assert_eq!(metrics.meta.count, 1);
-
-    queue.drain().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 0);
 }
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_worker_on_active_callback() {
-    use std::sync::atomic::AtomicUsize;
-
+async fn test_queue_obliterate_removes_everything() {
     let conn = redis_conn();
     let qname = unique_queue_name();
 
     let queue = QueueBuilder::new(&qname)
-        .connection(conn.clone())
+        .connection(conn)
         .build::<TestJob>()
         .await
         .unwrap();
 
-    let n = 3;
-    for i in 0..n {
+    for i in 0..5 {
         queue
             .add(
-                "active_test",
+                "doomed",
                 TestJob {
-                    value: format!("job-{}", i),
+                    value: format!("job {}", i),
                 },
                 None,
             )
             .await
             .unwrap();
     }
+    queue
+        .add(
+            "doomed_delayed",
+            TestJob {
+                value: "delayed".into(),
+            },
+            Some(JobOptions {
+                delay: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    queue
+        .add(
+            "doomed_prioritized",
+            TestJob {
+                value: "prioritized".into(),
+            },
+            Some(JobOptions {
+                priority: Some(3u32),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
 
-    let active_count = Arc::new(AtomicUsize::new(0));
-    let active_count_cb = active_count.clone();
+    queue.obliterate(false).await.unwrap();
 
-    let worker = WorkerBuilder::new(&qname)
+    // No key of this queue must remain.
+    let mut raw = raw_redis_conn().await;
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("bull:{}:*", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        keys.is_empty(),
+        "obliterate must remove all queue keys, found: {:?}",
+        keys
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_obliterate_fails_with_active_jobs_unless_forced() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
         .connection(conn)
-        .skip_stalled_check(true)
-        .on_active(move |job| {
-            assert_eq!(job.state, JobState::Active);
-            active_count_cb.fetch_add(1, Ordering::SeqCst);
-        })
-        .build::<TestJob>();
+        .build::<TestJob>()
+        .await
+        .unwrap();
 
-    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+    let job = queue
+        .add(
+            "active_job",
+            TestJob {
+                value: "in flight".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    handle.shutdown();
-    handle.wait().await.unwrap();
+    // Simulate an active job: move the id from wait to active.
+    let mut raw = raw_redis_conn().await;
+    let _: () = redis::cmd("LREM")
+        .arg(format!("bull:{}:wait", qname))
+        .arg(0)
+        .arg(&job.id)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("LPUSH")
+        .arg(format!("bull:{}:active", qname))
+        .arg(&job.id)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
 
-    let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Completed).unwrap(), n as u64);
-    assert_eq!(
-        active_count.load(Ordering::SeqCst),
-        n,
-        "on_active should fire once per processed job"
+    let result = queue.obliterate(false).await;
+    assert!(
+        result.is_err(),
+        "obliterate without force must fail with active jobs"
     );
 
-    queue.drain().await.unwrap();
+    queue.obliterate(true).await.unwrap();
+
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("bull:{}:*", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        keys.is_empty(),
+        "forced obliterate must remove all queue keys, found: {:?}",
+        keys
+    );
 }

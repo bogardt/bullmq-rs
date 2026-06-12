@@ -11,7 +11,8 @@ use crate::connection::RedisConnection;
 use crate::error::{BullmqError, BullmqResult};
 use crate::job::{cleanup_job, Job, JobContext};
 use crate::scripts::commands::{
-    add_delayed_job, add_log, add_prioritized_job, add_standard_job, get_metrics, pause,
+    add_delayed_job, add_log, add_prioritized_job, add_standard_job, clean_jobs_in_set, obliterate,
+    pause,
 };
 use crate::scripts::ScriptLoader;
 use crate::types::{JobOptions, JobState, Metrics, DEFAULT_MAX_EVENTS};
@@ -612,6 +613,84 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             DEFAULT_MAX_EVENTS,
         )
         .await
+    }
+
+    /// Remove jobs in a given state older than the grace period.
+    ///
+    /// `grace` is the minimum age of the jobs to be removed, `limit` caps the
+    /// number of removed jobs (`0` = unlimited), and `state` selects which
+    /// set to clean: `Completed` (default in BullMQ), `Failed`, `Wait`,
+    /// `Paused`, `Active`, `Delayed` or `Prioritized`.
+    ///
+    /// Returns the ids of the removed jobs.
+    pub async fn clean(
+        &self,
+        grace: std::time::Duration,
+        limit: u64,
+        state: JobState,
+    ) -> BullmqResult<Vec<String>> {
+        if state == JobState::WaitingChildren {
+            return Err(BullmqError::Other(
+                "Cannot clean waiting-children jobs".to_string(),
+            ));
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let timestamp = now_ms.saturating_sub(grace.as_millis() as u64);
+        let set_name = state.to_string();
+
+        // Mirrors BullMQ: iterate in chunks of at most 10k removals per call.
+        let max_count = if limit == 0 { u64::MAX } else { limit };
+        let max_count_per_call = max_count.min(10_000);
+
+        let mut conn = self.conn.clone();
+        let mut deleted_job_ids = Vec::new();
+        while (deleted_job_ids.len() as u64) < max_count {
+            let job_ids = clean_jobs_in_set::clean_jobs_in_set(
+                &self.scripts,
+                &mut conn,
+                &self.prefix,
+                &self.name,
+                &set_name,
+                timestamp,
+                max_count_per_call,
+            )
+            .await?;
+            let batch_len = job_ids.len() as u64;
+            deleted_job_ids.extend(job_ids);
+            if batch_len < max_count_per_call {
+                break;
+            }
+        }
+        Ok(deleted_job_ids)
+    }
+
+    /// Completely destroy the queue and all of its contents.
+    ///
+    /// The queue is paused first, then all job data and queue keys are
+    /// removed iteratively. Fails if the queue has active jobs, unless
+    /// `force` is `true`.
+    pub async fn obliterate(&self, force: bool) -> BullmqResult<()> {
+        self.pause().await?;
+
+        let mut conn = self.conn.clone();
+        loop {
+            let cursor = obliterate::obliterate(
+                &self.scripts,
+                &mut conn,
+                &self.prefix,
+                &self.name,
+                1000,
+                force,
+            )
+            .await?;
+            if cursor == 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// Check if the queue is currently paused.
