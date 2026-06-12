@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This cycle closes the [BullMQ v5 parity roadmap (#4)](https://github.com/bogardt/bullmq-rs/issues/4):
+everything listed under "Deliberately not in this release" for 2.0.0 has landed,
+except sandboxed processors (out of scope pending a design discussion).
+
+### Added
+
+- **JobScheduler / repeatable jobs** — `Queue::upsert_job_scheduler`,
+  `get_job_scheduler`, `get_job_schedulers`, `remove_job_scheduler`, with
+  cron `pattern` (via `croner`, IANA `tz` support), fixed `every` intervals,
+  `limit`, `start_date` / `end_date`, `immediately` and `offset`. Workers
+  automatically schedule the next iteration when a scheduler job finishes
+  (`addJobScheduler-11` / `updateJobScheduler-12` Lua ports, `repeat` zset +
+  `repeat:<id>` scheduler hashes, wire-identical to Node).
+- **Queue retention** — `Queue::clean(grace, limit, state)` and
+  `Queue::obliterate(force)` (`cleanJobsInSet-3` / `obliterate-2` Lua ports).
+- **Bulk operations** — `Queue::add_bulk`, `Queue::retry_jobs`,
+  `Queue::promote_jobs` (`moveJobsToWait-8` Lua port).
+- **Rate limiting** — `WorkerOptions::limiter` / `WorkerBuilder::limiter`
+  with `RateLimiterOptions { max, duration }`; limiter logic restored in
+  `moveToActive-11` / `moveToFinished-14` (shared `limiter` key, Node-compatible).
+- **Deduplication** — `JobOptions::deduplication` with
+  `DeduplicationOptions { id, ttl }`; restored in the add-job scripts and
+  `storeJob`; dedup key cleared on finalization; deduplicated adds return
+  the existing job's id, mirroring Node.
+- **Metrics** — `WorkerOptions::metrics` / `WorkerBuilder::metrics`
+  (`MetricsOptions { max_data_points }`) and `Queue::get_metrics(state, start, end)`
+  (`getMetrics-2` Lua port, per-minute data points).
+- **Worker control surface** — `WorkerHandle::pause(do_not_wait_active)`,
+  `resume`, `is_paused`, `is_running`; `WorkerHandle::cancel_job` (aborts the
+  in-flight processing future; the job is requeued via stalled-job recovery);
+  `WorkerBuilder::on_active` / `on_error` callbacks.
+- **Manual processing** — `Queue::get_next_job(token)`,
+  `Job::move_to_completed` / `move_to_failed`,
+  `Queue::extend_job_locks(job_ids, tokens, duration)` (`extendLocks-1` Lua port).
+- **Automated cross-language conformance in CI** — the `compat` job runs the
+  `tests/compat/` harness against `bullmq@5.x` on a Redis 7 service container
+  in both directions (Rust producer → Node reader, Node producer → Rust worker).
+
+### Known limitations
+
+- Dynamic `queue.rateLimit()` / manual rate-limit errors are not ported
+  (only the worker-level `limiter` option).
+- Deduplication `replace` / `extend` / `keepLastIfActive` modes are not exposed.
+- `cancel_job` aborts the future without cooperative `AbortSignal` semantics.
+- The repeat strategy is not pluggable (default cron/every strategy only).
+
 ## [2.0.0] — BullMQ v5 wire compatibility
 
 This is a **breaking release** that brings `bullmq-rs` in line with the

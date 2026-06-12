@@ -30,6 +30,19 @@ ecosystem tooling works out of the box against queues produced by
 - **Priorities** (sorted-set backed), **delays**, **retries** with fixed or
   exponential backoff.
 - **Concurrency** with prefetch-safe job dispatch.
+- **Repeatable jobs / JobScheduler** — cron patterns (with IANA timezones)
+  or fixed intervals, `limit`, start/end dates; workers reschedule the next
+  iteration automatically.
+- **Rate limiting** — `max` jobs per `duration` window, shared across all
+  workers of a queue (including Node.js ones).
+- **Deduplication** — `JobOptions::deduplication { id, ttl }`; duplicate adds
+  return the existing job.
+- **Queue retention** — `clean(grace, limit, state)` and `obliterate(force)`.
+- **Bulk operations** — `add_bulk`, `retry_jobs`, `promote_jobs`.
+- **Metrics** — per-minute finished-job counts (`get_metrics`), collected by
+  workers opted in via `WorkerBuilder::metrics`.
+- **Worker controls** — `pause`/`resume`/`is_paused`/`is_running` on the
+  handle, `cancel_job`, manual fetch with `get_next_job` + `extend_job_locks`.
 - **Queue events** via Redis Streams — typed `QueueEvent` enum delivered
   through `tokio::broadcast`.
 - **Flows** — `FlowProducer` for parent/child job trees, same-queue and
@@ -204,6 +217,39 @@ let root = producer.add(tree).await?;
 println!("Parent {} will run once both children complete", root.job.id);
 ```
 
+### 5. Repeatable jobs
+
+```rust
+use bullmq_rs::{JobSchedulerTemplate, RepeatOptions};
+use std::time::Duration;
+
+// Every 5 minutes, forever
+queue.upsert_job_scheduler(
+    "cleanup",
+    RepeatOptions { every: Some(Duration::from_secs(300)), ..Default::default() },
+    JobSchedulerTemplate { name: Some("cleanup".into()), data: None, opts: None },
+).await?;
+
+// Weekdays at 08:00 Paris time, 10 runs max
+queue.upsert_job_scheduler(
+    "daily-report",
+    RepeatOptions {
+        pattern: Some("0 8 * * 1-5".into()),
+        tz: Some("Europe/Paris".into()),
+        limit: Some(10),
+        ..Default::default()
+    },
+    JobSchedulerTemplate::default(),
+).await?;
+
+// Inspect / remove
+let schedulers = queue.get_job_schedulers(0, -1).await?;
+queue.remove_job_scheduler("cleanup").await?;
+```
+
+Workers process scheduler jobs like any other job and automatically
+enqueue the next iteration on completion.
+
 ## Interop with BullMQ Node
 
 Because the Redis wire format matches BullMQ v5, you can mix Rust and
@@ -252,6 +298,12 @@ All keys use `{prefix}:{queue_name}:{suffix}` (default prefix: `bull`):
 | `bull:<q>:<job_id>:logs` | List | Per-job logs (`job.log(...)`) |
 | `bull:<q>:<job_id>:lock` | String | Worker lock token, PX TTL |
 | `bull:<q>:<job_id>:dependencies` | Sorted Set | Flow children of this job |
+| `bull:<q>:repeat` | Sorted Set | Job schedulers (score = next run, ms) |
+| `bull:<q>:repeat:<id>` | Hash | Scheduler template + iteration count |
+| `bull:<q>:limiter` | String | Rate-limiter window counter (PX TTL) |
+| `bull:<q>:de:<dedup_id>` | String | Deduplication key (optional TTL) |
+| `bull:<q>:metrics:<state>` | Hash | Metrics meta (count, prevTS, prevCount) |
+| `bull:<q>:metrics:<state>:data` | List | Per-minute metrics data points |
 
 ## Requirements
 
