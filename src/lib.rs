@@ -62,6 +62,7 @@ pub mod flow_producer;
 pub mod types;
 
 pub mod job;
+pub(crate) mod repeat;
 pub(crate) mod scripts;
 
 pub mod queue;
@@ -78,7 +79,8 @@ pub use queue::{Queue, QueueBuilder};
 pub use queue_events::{QueueEvent, QueueEvents, QueueEventsBuilder};
 pub use queue_events_producer::{QueueEventsProducer, QueueEventsProducerBuilder};
 pub use types::{
-    BackoffStrategy, DeduplicationOptions, JobDependencies, JobOptions, JobState, Metrics,
-    MetricsMeta, MetricsOptions, RateLimiterOptions, WorkerOptions,
+    BackoffStrategy, DeduplicationOptions, JobDependencies, JobOptions, JobScheduler,
+    JobSchedulerTemplate, JobState, Metrics, MetricsMeta, MetricsOptions, RateLimiterOptions,
+    RepeatOptions, WorkerOptions,
 };
 pub use worker::{Worker, WorkerBuilder, WorkerHandle};

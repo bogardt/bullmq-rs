@@ -3,7 +3,8 @@
 
   Ported from BullMQ (stripped: parent/dependency, repeat).
 ]]
-local function storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp, parentKey, parentData)
+local function storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp, parentKey, parentData,
+                        repeatJobKey)
   local jsonOpts = cjson.encode(opts)
   local delay = opts['delay'] or 0
   local priority = opts['priority'] or 0
@@ -19,6 +20,10 @@ local function storeJob(eventsKey, jobIdKey, jobId, name, data, opts, timestamp,
 
   if parentData ~= nil and parentData ~= "" then
     rcall("HSET", jobIdKey, "parent", parentData)
+  end
+
+  if repeatJobKey then
+    rcall("HSET", jobIdKey, "rjk", repeatJobKey)
   end
 
   if debounceId then

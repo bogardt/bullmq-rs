@@ -192,6 +192,7 @@ fn test_job_options_serialization() {
         ttl: None,
         job_id: None,
         deduplication: None,
+        ..Default::default()
     };
     let json = serde_json::to_string(&opts).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -249,6 +250,7 @@ fn test_job_creation_with_options() {
         ttl: Some(Duration::from_secs(60)),
         job_id: None,
         deduplication: None,
+        ..Default::default()
     };
 
     let job = Job::new("2".into(), "delayed-job".into(), 42i32, Some(opts));
@@ -381,6 +383,7 @@ fn test_job_v2_roundtrip() {
         ttl: Some(Duration::from_millis(60000)),
         job_id: Some("custom-id".into()),
         deduplication: None,
+        ..Default::default()
     };
 
     let mut job = Job::new(

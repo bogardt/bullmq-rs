@@ -4465,3 +4465,703 @@ async fn test_worker_on_active_callback() {
 
     queue.drain().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Job scheduler (repeatable jobs)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_scheduler_every_iterations() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .upsert_job_scheduler(
+            "every-sched",
+            RepeatOptions {
+                every: Some(Duration::from_millis(1000)),
+                ..Default::default()
+            },
+            JobSchedulerTemplate {
+                name: Some("tick".into()),
+                data: Some(TestJob {
+                    value: "tick-data".into(),
+                }),
+                opts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        job.id.starts_with("repeat:every-sched:"),
+        "iteration job id should have the repeat:<id>:<millis> shape, got {}",
+        job.id
+    );
+    assert_eq!(job.name, "tick");
+
+    // The first iteration job must exist with the scheduler id in 'rjk'.
+    let mut raw = raw_redis_conn().await;
+    let rjk: String = redis::cmd("HGET")
+        .arg(format!("bull:{}:{}", qname, job.id))
+        .arg("rjk")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(rjk, "every-sched");
+
+    let processed = Arc::new(AtomicU64::new(0));
+    let processed_cb = processed.clone();
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker
+        .start(move |job| {
+            let processed = processed_cb.clone();
+            async move {
+                assert_eq!(job.data.value, "tick-data");
+                processed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    // Wait for at least 2 iterations to complete (auto-rescheduled).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while processed.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        processed.load(Ordering::SeqCst) >= 2,
+        "at least 2 iterations should have been processed, got {}",
+        processed.load(Ordering::SeqCst)
+    );
+
+    // The next iteration must be pending in the delayed set.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut next_pending = false;
+    while std::time::Instant::now() < deadline {
+        let delayed: Vec<String> = redis::cmd("ZRANGE")
+            .arg(format!("bull:{}:delayed", qname))
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        if delayed
+            .iter()
+            .any(|id| id.starts_with("repeat:every-sched:"))
+        {
+            next_pending = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(next_pending, "next iteration should be auto-scheduled");
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    queue.remove_job_scheduler("every-sched").await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_scheduler_cron_pattern() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    let job = queue
+        .upsert_job_scheduler(
+            "cron-sched",
+            RepeatOptions {
+                pattern: Some("* * * * *".into()),
+                ..Default::default()
+            },
+            JobSchedulerTemplate {
+                name: Some("cron-tick".into()),
+                data: Some(TestJob {
+                    value: "cron".into(),
+                }),
+                opts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut raw = raw_redis_conn().await;
+
+    // Scheduler hash stores the pattern.
+    let pattern: String = redis::cmd("HGET")
+        .arg(format!("bull:{}:repeat:cron-sched", qname))
+        .arg("pattern")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(pattern, "* * * * *");
+
+    // The next job is delayed to the next minute boundary.
+    let next_millis: u64 = job.id.rsplit(':').next().unwrap().parse().unwrap();
+    assert_eq!(
+        next_millis % 60_000,
+        0,
+        "next millis should be on a minute boundary"
+    );
+    assert!(next_millis > now && next_millis <= now + 60_000);
+
+    let delayed: Vec<String> = redis::cmd("ZRANGE")
+        .arg(format!("bull:{}:delayed", qname))
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(delayed.contains(&job.id), "iteration job should be delayed");
+
+    queue.remove_job_scheduler("cron-sched").await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_get_job_scheduler_metadata() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .upsert_job_scheduler(
+            "meta-sched",
+            RepeatOptions {
+                every: Some(Duration::from_secs(5)),
+                limit: Some(10),
+                ..Default::default()
+            },
+            JobSchedulerTemplate {
+                name: Some("meta-tick".into()),
+                data: Some(TestJob {
+                    value: "meta".into(),
+                }),
+                opts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let scheduler = queue
+        .get_job_scheduler("meta-sched")
+        .await
+        .unwrap()
+        .expect("scheduler should exist");
+    assert_eq!(scheduler.id, "meta-sched");
+    assert_eq!(scheduler.name, "meta-tick");
+    assert_eq!(scheduler.every, Some(5000));
+    assert_eq!(scheduler.limit, Some(10));
+    assert_eq!(scheduler.iteration_count, Some(1));
+    assert!(scheduler.next.is_some());
+    assert!(scheduler.pattern.is_none());
+    let template_data = scheduler.template_data.expect("template data stored");
+    assert_eq!(template_data["value"], "meta");
+
+    let schedulers = queue.get_job_schedulers(0, -1).await.unwrap();
+    assert_eq!(schedulers.len(), 1);
+    assert_eq!(schedulers[0].id, "meta-sched");
+    assert_eq!(schedulers[0].every, Some(5000));
+
+    assert!(queue.get_job_scheduler("missing").await.unwrap().is_none());
+
+    queue.remove_job_scheduler("meta-sched").await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_remove_job_scheduler() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .upsert_job_scheduler(
+            "rm-sched",
+            RepeatOptions {
+                pattern: Some("* * * * *".into()),
+                ..Default::default()
+            },
+            JobSchedulerTemplate {
+                name: Some("rm-tick".into()),
+                data: Some(TestJob { value: "rm".into() }),
+                opts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(queue.remove_job_scheduler("rm-sched").await.unwrap());
+
+    let mut raw = raw_redis_conn().await;
+    let zscore: Option<f64> = redis::cmd("ZSCORE")
+        .arg(format!("bull:{}:repeat", qname))
+        .arg("rm-sched")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(zscore.is_none(), "repeat zset entry should be removed");
+
+    let hash_exists: bool = redis::cmd("EXISTS")
+        .arg(format!("bull:{}:repeat:rm-sched", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(!hash_exists, "scheduler hash should be removed");
+
+    let delayed_count: u64 = redis::cmd("ZCARD")
+        .arg(format!("bull:{}:delayed", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(delayed_count, 0, "pending delayed job should be removed");
+
+    let job_exists: bool = redis::cmd("EXISTS")
+        .arg(format!("bull:{}:{}", qname, job.id))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(!job_exists, "pending iteration job hash should be removed");
+
+    assert!(
+        !queue.remove_job_scheduler("rm-sched").await.unwrap(),
+        "removing a missing scheduler should return false"
+    );
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_scheduler_limit_stops_iterations() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .upsert_job_scheduler(
+            "limit-sched",
+            RepeatOptions {
+                every: Some(Duration::from_millis(500)),
+                limit: Some(2),
+                ..Default::default()
+            },
+            JobSchedulerTemplate {
+                name: Some("limited".into()),
+                data: Some(TestJob {
+                    value: "limited".into(),
+                }),
+                opts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let processed = Arc::new(AtomicU64::new(0));
+    let processed_cb = processed.clone();
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker
+        .start(move |_job| {
+            let processed = processed_cb.clone();
+            async move {
+                processed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while processed.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Give the scheduler a chance to (wrongly) produce more iterations.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    assert_eq!(
+        processed.load(Ordering::SeqCst),
+        2,
+        "scheduler with limit=2 must stop after 2 iterations"
+    );
+
+    let mut raw = raw_redis_conn().await;
+    let delayed_count: u64 = redis::cmd("ZCARD")
+        .arg(format!("bull:{}:delayed", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(delayed_count, 0, "no further iteration should be pending");
+
+    queue.remove_job_scheduler("limit-sched").await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_job_scheduler_upsert_override_replaces_pending_job() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let first = queue
+        .upsert_job_scheduler(
+            "override-sched",
+            RepeatOptions {
+                pattern: Some("* * * * *".into()),
+                ..Default::default()
+            },
+            JobSchedulerTemplate {
+                name: Some("v1".into()),
+                data: Some(TestJob { value: "v1".into() }),
+                opts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let second = queue
+        .upsert_job_scheduler(
+            "override-sched",
+            RepeatOptions {
+                pattern: Some("* * * * *".into()),
+                ..Default::default()
+            },
+            JobSchedulerTemplate {
+                name: Some("v2".into()),
+                data: Some(TestJob { value: "v2".into() }),
+                opts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut raw = raw_redis_conn().await;
+    let delayed: Vec<String> = redis::cmd("ZRANGE")
+        .arg(format!("bull:{}:delayed", qname))
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(
+        delayed.len(),
+        1,
+        "override must replace the pending delayed job, not orphan it (got {:?})",
+        delayed
+    );
+    assert_eq!(delayed[0], second.id);
+    if first.id != second.id {
+        let orphan_exists: bool = redis::cmd("EXISTS")
+            .arg(format!("bull:{}:{}", qname, first.id))
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert!(!orphan_exists, "the first pending job must be deleted");
+    }
+
+    let scheduler = queue
+        .get_job_scheduler("override-sched")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(scheduler.name, "v2");
+
+    queue.remove_job_scheduler("override-sched").await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Worker advanced controls
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_extend_job_locks() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .add(
+            "lockme",
+            TestJob {
+                value: "lock".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let token = "test-lock-token";
+    let fetched = queue
+        .get_next_job(token)
+        .await
+        .unwrap()
+        .expect("job should be fetched");
+    assert_eq!(fetched.id, job.id);
+
+    // Wrong token: the job id must be reported as failed.
+    let failed = queue
+        .extend_job_locks(
+            std::slice::from_ref(&job.id),
+            &["wrong-token".to_string()],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed, vec![job.id.clone()]);
+
+    // Correct token: lock TTL is refreshed.
+    let failed = queue
+        .extend_job_locks(
+            std::slice::from_ref(&job.id),
+            &[token.to_string()],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(failed.is_empty());
+
+    let mut raw = raw_redis_conn().await;
+    let pttl: i64 = redis::cmd("PTTL")
+        .arg(format!("bull:{}:{}:lock", qname, job.id))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        pttl > 30_000 && pttl <= 60_000,
+        "lock PTTL should be refreshed to ~60s, got {}",
+        pttl
+    );
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_cancel_job_aborts_handler() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .add(
+            "long",
+            TestJob {
+                value: "long".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let started = Arc::new(AtomicU64::new(0));
+    let completed = Arc::new(AtomicU64::new(0));
+    let started_cb = started.clone();
+    let completed_cb = completed.clone();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker
+        .start(move |_job| {
+            let started = started_cb.clone();
+            let completed = completed_cb.clone();
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    // Wait for the handler to start, then cancel after ~500ms.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while started.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "handler should have started"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        handle.cancel_job(&job.id),
+        "cancel_job should signal the in-flight job"
+    );
+    assert!(
+        !handle.cancel_job(&job.id),
+        "second cancel of the same job should return false"
+    );
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        completed.load(Ordering::SeqCst),
+        0,
+        "the handler future must have been aborted"
+    );
+
+    // The job is neither completed nor failed: it stays in the active list
+    // (with its lock left to expire) until a stalled checker recovers it.
+    // Waiting for stalled recovery is too slow for this test, so only the
+    // not-finished + still-active state is asserted.
+    let mut raw = raw_redis_conn().await;
+    let completed_count: u64 = redis::cmd("ZCARD")
+        .arg(format!("bull:{}:completed", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(completed_count, 0);
+    let active: Vec<String> = redis::cmd("LRANGE")
+        .arg(format!("bull:{}:active", qname))
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        active.contains(&job.id),
+        "cancelled job should still be in active"
+    );
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_get_next_job() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .add(
+            "manual",
+            TestJob {
+                value: "manual".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let token = "manual-token";
+    let fetched = queue
+        .get_next_job(token)
+        .await
+        .unwrap()
+        .expect("a job should be returned");
+    assert_eq!(fetched.id, job.id);
+    assert_eq!(fetched.name, "manual");
+    assert_eq!(fetched.data.value, "manual");
+    assert_eq!(fetched.state, JobState::Active);
+
+    let mut raw = raw_redis_conn().await;
+    let active: Vec<String> = redis::cmd("LRANGE")
+        .arg(format!("bull:{}:active", qname))
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        active.contains(&job.id),
+        "fetched job should be in the active list"
+    );
+
+    assert!(
+        queue.get_next_job(token).await.unwrap().is_none(),
+        "no more jobs should be available"
+    );
+
+    // Complete the fetched job manually.
+    let mut fetched = fetched;
+    fetched
+        .move_to_completed(serde_json::json!({"ok": true}))
+        .await
+        .unwrap();
+    let completed_count: u64 = redis::cmd("ZCARD")
+        .arg(format!("bull:{}:completed", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(completed_count, 1);
+
+    queue.drain().await.unwrap();
+}

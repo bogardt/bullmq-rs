@@ -90,6 +90,127 @@ pub struct JobOptions {
     /// Deduplication options. Serialized as `de` to match the BullMQ wire format.
     #[serde(rename = "de", skip_serializing_if = "Option::is_none", default)]
     pub deduplication: Option<DeduplicationOptions>,
+    /// Repeat options carried by every job produced by a job scheduler.
+    /// Managed by [`crate::Queue::upsert_job_scheduler`]; not meant to be set
+    /// directly on regular jobs.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub repeat: Option<RepeatOptions>,
+    /// Iteration timestamp (ms) this scheduler-produced job was created for.
+    /// Managed by the job scheduler.
+    #[serde(
+        rename = "prevMillis",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub prev_millis: Option<u64>,
+    /// Id of the job scheduler that produced this job. Managed by the job
+    /// scheduler (also stored as the `rjk` hash field).
+    #[serde(
+        rename = "repeatJobKey",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub repeat_job_key: Option<String>,
+    /// Creation timestamp (ms) recorded in the serialized options by the job
+    /// scheduler, mirroring BullMQ Node's merged options.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub timestamp: Option<u64>,
+}
+
+/// Repeat options for a job scheduler (repeatable job).
+///
+/// Exactly one of [`pattern`](Self::pattern) (cron) or [`every`](Self::every)
+/// must be set. Serializes to JSON matching the BullMQ Node.js `repeat`
+/// options format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RepeatOptions {
+    /// Cron pattern (cron-parser syntax: 5 fields, or 6 fields with leading
+    /// seconds), e.g. `"* * * * *"` for every minute.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pattern: Option<String>,
+    /// Fixed interval between iterations.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        with = "option_duration_millis",
+        default
+    )]
+    pub every: Option<Duration>,
+    /// Maximum total number of iterations.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub limit: Option<u64>,
+    /// Earliest time (ms since Unix epoch) for the first iteration.
+    #[serde(rename = "startDate", skip_serializing_if = "Option::is_none", default)]
+    pub start_date: Option<u64>,
+    /// Time (ms since Unix epoch) after which no more iterations are produced.
+    #[serde(rename = "endDate", skip_serializing_if = "Option::is_none", default)]
+    pub end_date: Option<u64>,
+    /// IANA timezone used to evaluate the cron `pattern` (e.g. "Europe/Paris").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tz: Option<String>,
+    /// Produce the first iteration immediately instead of waiting for the next
+    /// cron match. Only valid with `pattern`, and incompatible with
+    /// `start_date`. Never serialized, mirroring BullMQ Node.
+    #[serde(skip, default)]
+    pub immediately: bool,
+    /// Offset in milliseconds within `every` slots. Managed by the scheduler.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub offset: Option<u64>,
+    /// Iteration counter. Managed by the scheduler.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub count: Option<u64>,
+}
+
+/// Job template applied to every job produced by a job scheduler.
+#[derive(Debug, Clone)]
+pub struct JobSchedulerTemplate<T> {
+    /// Name of the produced jobs. Defaults to the scheduler id.
+    pub name: Option<String>,
+    /// Data payload of the produced jobs.
+    pub data: Option<T>,
+    /// Options applied to the produced jobs.
+    pub opts: Option<JobOptions>,
+}
+
+impl<T> Default for JobSchedulerTemplate<T> {
+    fn default() -> Self {
+        Self {
+            name: None,
+            data: None,
+            opts: None,
+        }
+    }
+}
+
+/// Metadata of a job scheduler as returned by
+/// [`crate::Queue::get_job_scheduler`].
+#[derive(Debug, Clone, Default)]
+pub struct JobScheduler {
+    /// Scheduler id (the `key` in BullMQ Node).
+    pub id: String,
+    /// Name of the produced jobs.
+    pub name: String,
+    /// Timestamp (ms) of the next scheduled iteration.
+    pub next: Option<u64>,
+    /// Number of iterations produced so far.
+    pub iteration_count: Option<u64>,
+    /// Maximum total number of iterations.
+    pub limit: Option<u64>,
+    /// Earliest time (ms since Unix epoch) for the first iteration.
+    pub start_date: Option<u64>,
+    /// Time (ms since Unix epoch) after which no more iterations are produced.
+    pub end_date: Option<u64>,
+    /// IANA timezone used to evaluate the cron pattern.
+    pub tz: Option<String>,
+    /// Cron pattern.
+    pub pattern: Option<String>,
+    /// Fixed interval between iterations (ms).
+    pub every: Option<u64>,
+    /// Offset in milliseconds within `every` slots.
+    pub offset: Option<u64>,
+    /// Template data payload of the produced jobs.
+    pub template_data: Option<serde_json::Value>,
+    /// Template options of the produced jobs.
+    pub template_opts: Option<JobOptions>,
 }
 
 /// Job deduplication options.

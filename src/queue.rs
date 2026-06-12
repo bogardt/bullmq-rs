@@ -11,11 +11,15 @@ use crate::connection::RedisConnection;
 use crate::error::{BullmqError, BullmqResult};
 use crate::job::{cleanup_job, Job, JobContext};
 use crate::scripts::commands::{
-    add_delayed_job, add_log, add_prioritized_job, add_standard_job, clean_jobs_in_set,
-    get_metrics, move_jobs_to_wait, obliterate, pause,
+    add_delayed_job, add_job_scheduler, add_log, add_prioritized_job, add_standard_job,
+    clean_jobs_in_set, extend_locks, get_job_scheduler, get_metrics, move_jobs_to_wait,
+    move_to_active, obliterate, pause, remove_job_scheduler,
 };
 use crate::scripts::ScriptLoader;
-use crate::types::{JobOptions, JobState, Metrics, DEFAULT_MAX_EVENTS};
+use crate::types::{
+    JobOptions, JobScheduler, JobSchedulerTemplate, JobState, Metrics, RepeatOptions,
+    DEFAULT_MAX_EVENTS,
+};
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -929,6 +933,273 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
         .await
     }
 
+    /// Create or update a job scheduler (repeatable job) and schedule its
+    /// next iteration.
+    ///
+    /// Mirrors Node BullMQ `Queue.upsertJobScheduler`. Exactly one of
+    /// [`RepeatOptions::pattern`] or [`RepeatOptions::every`] must be set.
+    /// When upserting over an existing scheduler, the pending iteration job
+    /// is replaced (no orphan is left behind). After each iteration finishes,
+    /// workers automatically schedule the following one until `limit` or
+    /// `end_date` is reached, or the scheduler is removed.
+    ///
+    /// Returns the first iteration job, whose id has the shape
+    /// `repeat:<scheduler_id>:<next_millis>`. Errors when the iteration
+    /// `limit` or `end_date` is already exhausted (Node returns `undefined`
+    /// in those cases).
+    pub async fn upsert_job_scheduler(
+        &self,
+        scheduler_id: &str,
+        repeat_opts: RepeatOptions,
+        template: JobSchedulerTemplate<T>,
+    ) -> BullmqResult<Job<T>> {
+        if repeat_opts.pattern.is_some() && repeat_opts.every.is_some() {
+            return Err(BullmqError::Other(
+                "Both .pattern and .every options are defined for this repeatable job".into(),
+            ));
+        }
+        if repeat_opts.pattern.is_none() && repeat_opts.every.is_none() {
+            return Err(BullmqError::Other(
+                "Either .pattern or .every options must be defined for this repeatable job".into(),
+            ));
+        }
+        if repeat_opts.immediately && repeat_opts.start_date.is_some() {
+            return Err(BullmqError::Other(
+                "Both .immediately and .startDate options are defined for this repeatable job"
+                    .into(),
+            ));
+        }
+
+        let iteration_count = repeat_opts.count.map(|c| c + 1).unwrap_or(1);
+        if let Some(limit) = repeat_opts.limit {
+            if iteration_count > limit {
+                return Err(BullmqError::Other(format!(
+                    "Job scheduler {} reached its iteration limit",
+                    scheduler_id
+                )));
+            }
+        }
+
+        let mut now = now_ms();
+        if let Some(end_date) = repeat_opts.end_date {
+            if now > end_date {
+                return Err(BullmqError::Other(format!(
+                    "Job scheduler {} is past its end date",
+                    scheduler_id
+                )));
+            }
+        }
+
+        let template_opts = template.opts.unwrap_or_default();
+        let prev_millis = template_opts.prev_millis.unwrap_or(0);
+        if prev_millis > now {
+            now = prev_millis;
+        }
+
+        let next_millis = match &repeat_opts.pattern {
+            Some(pattern) => crate::repeat::next_pattern_millis(now, &repeat_opts, pattern)?
+                .ok_or_else(|| {
+                    BullmqError::Other(format!("No next occurrence for cron pattern '{}'", pattern))
+                })?
+                .max(now),
+            // The Lua script computes nextMillis itself in 'every' mode.
+            None => 0,
+        };
+
+        let job_name = template
+            .name
+            .clone()
+            .unwrap_or_else(|| scheduler_id.to_string());
+        let template_data_json = match &template.data {
+            Some(data) => serde_json::to_string(data)?,
+            None => "{}".to_string(),
+        };
+
+        let merged_opts = crate::repeat::build_iteration_opts(
+            &template_opts,
+            &repeat_opts,
+            scheduler_id,
+            iteration_count,
+            if repeat_opts.pattern.is_some() {
+                Some(next_millis)
+            } else {
+                None
+            },
+        );
+
+        let scheduler_opts_json = scheduler_opts_json(&job_name, &repeat_opts)?;
+        let template_opts_json = serde_json::to_string(&template_opts)?;
+        let delayed_opts_json = serde_json::to_string(&merged_opts)?;
+
+        let mut conn = self.conn.clone();
+        let result = add_job_scheduler::add_job_scheduler(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            scheduler_id,
+            next_millis,
+            &scheduler_opts_json,
+            &template_data_json,
+            &template_opts_json,
+            &delayed_opts_json,
+            now_ms(),
+            None,
+        )
+        .await?;
+
+        let data: T = match template.data {
+            Some(data) => data,
+            None => serde_json::from_str("{}").map_err(|_| {
+                BullmqError::Other(
+                    "JobSchedulerTemplate.data is required for this payload type".into(),
+                )
+            })?,
+        };
+
+        let mut opts = merged_opts;
+        opts.job_id = Some(result.job_id.clone());
+        opts.delay = Some(std::time::Duration::from_millis(result.delay));
+
+        let mut job = Job::new(result.job_id, job_name, data, Some(opts));
+        job.state = if result.delay > 0 {
+            JobState::Delayed
+        } else {
+            JobState::Wait
+        };
+        job.repeat_job_key = Some(scheduler_id.to_string());
+        job.ctx = Some(self.job_context());
+        Ok(job)
+    }
+
+    /// Get a job scheduler's metadata, or `None` when it does not exist.
+    pub async fn get_job_scheduler(&self, id: &str) -> BullmqResult<Option<JobScheduler>> {
+        let mut conn = self.conn.clone();
+        let Some((map, next)) = get_job_scheduler::get_job_scheduler(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            id,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        if map.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(scheduler_from_hash(id, &map, Some(next))))
+    }
+
+    /// List job schedulers from the repeat sorted set, ordered by next
+    /// iteration timestamp (ascending). `start` and `end` are zero-based
+    /// inclusive indexes (`0, -1` returns all).
+    pub async fn get_job_schedulers(
+        &self,
+        start: i64,
+        end: i64,
+    ) -> BullmqResult<Vec<JobScheduler>> {
+        let mut conn = self.conn.clone();
+        let entries: Vec<(String, f64)> = redis::cmd("ZRANGE")
+            .arg(self.key("repeat"))
+            .arg(start)
+            .arg(end)
+            .arg("WITHSCORES")
+            .query_async(&mut conn)
+            .await?;
+
+        let mut schedulers = Vec::with_capacity(entries.len());
+        for (id, score) in entries {
+            let map: HashMap<String, String> =
+                conn.hgetall(self.key(&format!("repeat:{}", id))).await?;
+            schedulers.push(scheduler_from_hash(&id, &map, Some(score as u64)));
+        }
+        Ok(schedulers)
+    }
+
+    /// Remove a job scheduler, its metadata, and its pending iteration job.
+    ///
+    /// Returns `true` when the scheduler existed and was removed.
+    pub async fn remove_job_scheduler(&self, id: &str) -> BullmqResult<bool> {
+        let mut conn = self.conn.clone();
+        remove_job_scheduler::remove_job_scheduler(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            id,
+        )
+        .await
+    }
+
+    /// Manually fetch the next job from the queue, moving it to active and
+    /// acquiring a lock with the given `token` (mirrors `worker.getNextJob`
+    /// in Node BullMQ, without blocking).
+    ///
+    /// The lock is held for 30 seconds. The caller is responsible for:
+    /// - extending the lock while processing (see
+    ///   [`Queue::extend_job_locks`]), and
+    /// - finishing the job via [`Job::move_to_completed`] /
+    ///   [`Job::move_to_failed`].
+    ///
+    /// If the job is neither finished nor its lock extended, it will be
+    /// recovered by a worker's stalled-job checker after the lock expires.
+    pub async fn get_next_job(&self, token: &str) -> BullmqResult<Option<Job<T>>> {
+        let mut conn = self.conn.clone();
+        let result = move_to_active::move_to_active(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            token,
+            30_000,
+            now_ms(),
+            DEFAULT_MAX_EVENTS,
+            None,
+        )
+        .await?;
+
+        let Some(job_id) = result.job_id else {
+            return Ok(None);
+        };
+        let mut job = Job::from_redis_hash(&job_id, &result.job_data)?;
+        job.state = JobState::Active;
+        job.lock_token = Some(token.to_string());
+        job.ctx = Some(self.job_context());
+        Ok(Some(job))
+    }
+
+    /// Extend the locks of multiple jobs in one round trip (mirrors
+    /// `scripts.extendLocks` in Node BullMQ). `job_ids` and `tokens` are
+    /// matched by index and must have the same length.
+    ///
+    /// Returns the ids of the jobs whose lock could NOT be extended (missing
+    /// lock or token mismatch); an empty vector means all succeeded.
+    pub async fn extend_job_locks(
+        &self,
+        job_ids: &[String],
+        tokens: &[String],
+        duration: std::time::Duration,
+    ) -> BullmqResult<Vec<String>> {
+        if job_ids.len() != tokens.len() {
+            return Err(BullmqError::Other(
+                "extend_job_locks requires job_ids and tokens of the same length".into(),
+            ));
+        }
+        let mut conn = self.conn.clone();
+        extend_locks::extend_locks(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            job_ids,
+            tokens,
+            duration.as_millis() as u64,
+        )
+        .await
+    }
+
     /// Get the queue name.
     pub fn name(&self) -> &str {
         &self.name
@@ -937,6 +1208,67 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
     /// Build a Redis key with the queue prefix.
     pub(crate) fn key(&self, suffix: &str) -> String {
         format!("{}:{}:{}", self.prefix, self.name, suffix)
+    }
+}
+
+/// Serialize the scheduler options stored in the `repeat:<id>` hash,
+/// matching the fields Node passes to the addJobScheduler script.
+fn scheduler_opts_json(name: &str, repeat: &RepeatOptions) -> BullmqResult<String> {
+    let mut map = serde_json::Map::new();
+    map.insert("name".into(), serde_json::Value::from(name));
+    if let Some(start_date) = repeat.start_date {
+        map.insert("startDate".into(), serde_json::Value::from(start_date));
+    }
+    if let Some(end_date) = repeat.end_date {
+        map.insert("endDate".into(), serde_json::Value::from(end_date));
+    }
+    if let Some(ref tz) = repeat.tz {
+        map.insert("tz".into(), serde_json::Value::from(tz.clone()));
+    }
+    if let Some(ref pattern) = repeat.pattern {
+        map.insert("pattern".into(), serde_json::Value::from(pattern.clone()));
+    }
+    if let Some(every) = repeat.every {
+        map.insert(
+            "every".into(),
+            serde_json::Value::from(every.as_millis() as u64),
+        );
+    }
+    if let Some(limit) = repeat.limit {
+        map.insert("limit".into(), serde_json::Value::from(limit));
+    }
+    // Node only forwards an explicit offset in 'every' mode.
+    if repeat.every.is_some() {
+        if let Some(offset) = repeat.offset {
+            map.insert("offset".into(), serde_json::Value::from(offset));
+        }
+    }
+    Ok(serde_json::to_string(&serde_json::Value::Object(map))?)
+}
+
+fn hash_num(map: &HashMap<String, String>, field: &str) -> Option<u64> {
+    map.get(field)
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| f as u64)
+}
+
+/// Build a [`JobScheduler`] from the `repeat:<id>` hash fields, mirroring
+/// Node's `transformSchedulerData`.
+fn scheduler_from_hash(id: &str, map: &HashMap<String, String>, next: Option<u64>) -> JobScheduler {
+    JobScheduler {
+        id: id.to_string(),
+        name: map.get("name").cloned().unwrap_or_default(),
+        next,
+        iteration_count: hash_num(map, "ic"),
+        limit: hash_num(map, "limit"),
+        start_date: hash_num(map, "startDate"),
+        end_date: hash_num(map, "endDate"),
+        tz: map.get("tz").cloned(),
+        pattern: map.get("pattern").cloned(),
+        every: hash_num(map, "every"),
+        offset: hash_num(map, "offset"),
+        template_data: map.get("data").and_then(|s| serde_json::from_str(s).ok()),
+        template_opts: map.get("opts").and_then(|s| serde_json::from_str(s).ok()),
     }
 }
 

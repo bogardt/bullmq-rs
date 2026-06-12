@@ -66,6 +66,11 @@ impl ScriptLoader {
         register!("cleanJobsInSet", "cleanJobsInSet-3.lua");
         register!("obliterate", "obliterate-2.lua");
         register!("getMetrics", "getMetrics-2.lua");
+        register!("addJobScheduler", "addJobScheduler-11.lua");
+        register!("updateJobScheduler", "updateJobScheduler-12.lua");
+        register!("getJobScheduler", "getJobScheduler-1.lua");
+        register!("removeJobScheduler", "removeJobScheduler-3.lua");
+        register!("extendLocks", "extendLocks-1.lua");
 
         Self { scripts }
     }
@@ -127,6 +132,15 @@ impl ScriptLoader {
         inc!("removeZSetJobs", "removeZSetJobs.lua");
         inc!("cleanList", "cleanList.lua");
         inc!("cleanSet", "cleanSet.lua");
+        inc!("isQueuePaused", "isQueuePaused.lua");
+        inc!("addDelayedJob", "addDelayedJob.lua");
+        inc!("storeAndEnqueueJob", "storeAndEnqueueJob.lua");
+        inc!("addJobFromScheduler", "addJobFromScheduler.lua");
+        inc!("storeJobScheduler", "storeJobScheduler.lua");
+        inc!(
+            "getJobSchedulerEveryNextMillis",
+            "getJobSchedulerEveryNextMillis.lua"
+        );
         m
     }
 
@@ -219,6 +233,11 @@ mod tests {
         assert!(loader.scripts.contains_key("cleanJobsInSet"));
         assert!(loader.scripts.contains_key("obliterate"));
         assert!(loader.scripts.contains_key("getMetrics"));
-        assert_eq!(loader.scripts.len(), 18);
+        assert!(loader.scripts.contains_key("addJobScheduler"));
+        assert!(loader.scripts.contains_key("updateJobScheduler"));
+        assert!(loader.scripts.contains_key("getJobScheduler"));
+        assert!(loader.scripts.contains_key("removeJobScheduler"));
+        assert!(loader.scripts.contains_key("extendLocks"));
+        assert_eq!(loader.scripts.len(), 23);
     }
 }
