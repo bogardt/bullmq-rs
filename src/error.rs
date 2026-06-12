@@ -17,6 +17,10 @@ pub enum BullmqError {
     QueuePaused,
     /// Lua script error.
     ScriptError(String),
+    /// Manual rate-limit marker: return `Box::new(BullmqError::RateLimited)`
+    /// from a worker handler to move the job back to wait without consuming
+    /// an attempt (mirrors Node `Worker.RateLimitError()`).
+    RateLimited,
     /// Generic error.
     Other(String),
     /// Feature not yet implemented.
@@ -35,6 +39,7 @@ impl fmt::Display for BullmqError {
             }
             BullmqError::QueuePaused => write!(f, "Queue is paused"),
             BullmqError::ScriptError(msg) => write!(f, "Script error: {}", msg),
+            BullmqError::RateLimited => write!(f, "bullmq:rateLimitExceeded"),
             BullmqError::Other(msg) => write!(f, "{}", msg),
             BullmqError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
         }

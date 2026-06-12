@@ -78,6 +78,7 @@ pub use job::Job;
 pub use queue::{Queue, QueueBuilder};
 pub use queue_events::{QueueEvent, QueueEvents, QueueEventsBuilder};
 pub use queue_events_producer::{QueueEventsProducer, QueueEventsProducerBuilder};
+pub use tokio_util::sync::CancellationToken;
 pub use types::{
     BackoffStrategy, DeduplicationOptions, JobDependencies, JobOptions, JobScheduler,
     JobSchedulerTemplate, JobState, Metrics, MetricsMeta, MetricsOptions, RateLimiterOptions,

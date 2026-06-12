@@ -504,12 +504,21 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
 
     /// Remove this job from the queue.
     ///
-    /// Removes the job ID from all state lists/sets and deletes the job hash,
-    /// lock key, and logs key. Not atomic (multiple Redis commands).
+    /// Atomically removes the job from all states and deletes all of its
+    /// data, including the deduplication key it owns (`de:<id>`). Fails when
+    /// the job is locked by a worker or belongs to a job scheduler.
     pub async fn remove(&self) -> BullmqResult<()> {
         let ctx = self.ctx()?;
         let mut conn = ctx.conn.clone();
-        cleanup_job(&mut conn, &ctx.prefix, &ctx.queue_name, &self.id).await
+        crate::scripts::commands::remove_job::remove_job(
+            &ctx.scripts,
+            &mut conn,
+            &ctx.prefix,
+            &ctx.queue_name,
+            &self.id,
+            false,
+        )
+        .await
     }
 
     /// Move this active job back to delayed with a new delay.

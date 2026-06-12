@@ -13,13 +13,17 @@ use crate::job::{cleanup_job, Job, JobContext};
 use crate::scripts::commands::{
     add_delayed_job, add_job_scheduler, add_log, add_prioritized_job, add_standard_job,
     clean_jobs_in_set, extend_locks, get_job_scheduler, get_metrics, move_jobs_to_wait,
-    move_to_active, obliterate, pause, remove_job_scheduler,
+    move_to_active, obliterate, pause, remove_job, remove_job_scheduler,
 };
 use crate::scripts::ScriptLoader;
 use crate::types::{
     JobOptions, JobScheduler, JobSchedulerTemplate, JobState, Metrics, RepeatOptions,
     DEFAULT_MAX_EVENTS,
 };
+
+/// JavaScript `Number.MAX_SAFE_INTEGER`, the limiter value Node writes for a
+/// manual rate limit.
+pub(crate) const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -588,11 +592,23 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             .await
     }
 
-    /// Remove a job by its ID from all state lists/sets and delete its hash,
-    /// lock key, and logs key.
+    /// Remove a job by its ID from all states and delete all of its data,
+    /// including the deduplication key it owns (`de:<id>`).
+    ///
+    /// Mirrors Node BullMQ `Queue.remove` (removeJob-2.lua), except children
+    /// are kept (Node defaults to `removeChildren: true`). Fails when the job
+    /// is locked by a worker or is the current iteration of a job scheduler.
     pub async fn remove(&self, job_id: &str) -> BullmqResult<()> {
         let mut conn = self.conn.clone();
-        cleanup_job(&mut conn, &self.prefix, &self.name, job_id).await
+        remove_job::remove_job(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            job_id,
+            false,
+        )
+        .await
     }
 
     /// Remove all jobs from the queue (drain).
@@ -769,6 +785,36 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             DEFAULT_MAX_EVENTS,
         )
         .await
+    }
+
+    /// Overrides the rate limit to be active for the next jobs.
+    ///
+    /// Sets the limiter key to `Number.MAX_SAFE_INTEGER` with a `PX` expiry,
+    /// exactly like Node BullMQ `Queue.rateLimit`. Workers configured with
+    /// [`RateLimiterOptions`](crate::RateLimiterOptions) will not fetch jobs
+    /// until the key expires (or [`Queue::remove_rate_limit_key`] is called).
+    pub async fn rate_limit(&self, duration: std::time::Duration) -> BullmqResult<()> {
+        let mut conn = self.conn.clone();
+        redis::cmd("SET")
+            .arg(self.key("limiter"))
+            .arg(MAX_SAFE_INTEGER)
+            .arg("PX")
+            .arg(duration.as_millis() as u64)
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Remove the rate limit key, lifting any active rate limit immediately.
+    ///
+    /// Returns `true` when a limiter key existed and was deleted.
+    pub async fn remove_rate_limit_key(&self) -> BullmqResult<bool> {
+        let mut conn = self.conn.clone();
+        let deleted: i64 = redis::cmd("DEL")
+            .arg(self.key("limiter"))
+            .query_async(&mut conn)
+            .await?;
+        Ok(deleted > 0)
     }
 
     /// Remove jobs in a given state older than the grace period.
