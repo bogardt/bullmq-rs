@@ -20,7 +20,7 @@ use crate::scripts::commands::{
     extend_lock, move_stalled_jobs_to_wait, move_to_active, move_to_delayed, move_to_finished,
 };
 use crate::scripts::ScriptLoader;
-use crate::types::{WorkerOptions, DEFAULT_MAX_EVENTS};
+use crate::types::{RateLimiterOptions, WorkerOptions, DEFAULT_MAX_EVENTS};
 
 const MARKER_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_CONN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -184,6 +184,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         let on_completed = self.on_completed.clone();
         let on_failed = self.on_failed.clone();
         let lock_duration_ms = self.options.lock_duration.as_millis() as u64;
+        let limiter = self.options.limiter;
         let stalled_interval = self.options.stalled_interval;
         let max_stalled_count = self.options.max_stalled_count;
         let skip_stalled_check = self.options.skip_stalled_check;
@@ -417,11 +418,14 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         lock_duration_ms,
                                         timestamp,
                                         DEFAULT_MAX_EVENTS,
+                                        limiter.as_ref(),
                                     )
                                     .await
                                     {
                                         Ok(result) => {
-                                            if result.job_id.is_some() {
+                                            if result.job_id.is_some()
+                                                || result.rate_limit_ttl.is_some()
+                                            {
                                                 Some(result)
                                             } else {
                                                 None
@@ -455,10 +459,16 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         lock_duration_ms,
                                         timestamp,
                                         DEFAULT_MAX_EVENTS,
+                                        limiter.as_ref(),
                                     )
                                     .await
                                     {
-                                        Ok(result) if result.job_id.is_some() => Some(result),
+                                        Ok(result)
+                                            if result.job_id.is_some()
+                                                || result.rate_limit_ttl.is_some() =>
+                                        {
+                                            Some(result)
+                                        }
                                         Ok(_) => {
                                             continue;
                                         }
@@ -480,10 +490,16 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         lock_duration_ms,
                                         timestamp,
                                         DEFAULT_MAX_EVENTS,
+                                        limiter.as_ref(),
                                     )
                                     .await
                                     {
-                                        Ok(result) if result.job_id.is_some() => Some(result),
+                                        Ok(result)
+                                            if result.job_id.is_some()
+                                                || result.rate_limit_ttl.is_some() =>
+                                        {
+                                            Some(result)
+                                        }
                                         Ok(_) => None,
                                         Err(e) => {
                                             tracing::warn!("moveToActive error: {}", e);
@@ -505,10 +521,16 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                     lock_duration_ms,
                                     timestamp,
                                     DEFAULT_MAX_EVENTS,
+                                    limiter.as_ref(),
                                 )
                                 .await
                                 {
-                                    Ok(result) if result.job_id.is_some() => Some(result),
+                                    Ok(result)
+                                        if result.job_id.is_some()
+                                            || result.rate_limit_ttl.is_some() =>
+                                    {
+                                        Some(result)
+                                    }
                                     Ok(_) => {
                                         continue;
                                     }
@@ -523,6 +545,25 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
 
                     // If we have a job result from moveToActive, process it.
                     if let Some(result) = move_result {
+                        if let Some(ttl) = result.rate_limit_ttl {
+                            // Rate limited: sleep until the limiter window expires
+                            // (bounded; the next moveToActive re-checks the TTL).
+                            let wait_ms = ttl.clamp(10, 30_000);
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {},
+                                _ = shutdown_rx.changed() => break,
+                            }
+                            // BZPOPMIN consumed the marker while the queue was
+                            // limited; restore it so waiting jobs are picked up
+                            // immediately instead of after the block timeout.
+                            let _: redis::RedisResult<i64> = redis::cmd("ZADD")
+                                .arg(&marker_key)
+                                .arg(0i64)
+                                .arg("0")
+                                .query_async(&mut cmd_conn)
+                                .await;
+                            continue;
+                        }
                         if let Some(job_id) = result.job_id {
                             // Deserialize the job from the hash data returned by moveToActive.
                             let mut job: Job<T> =
@@ -609,6 +650,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             fetch_next,
                                             task_lock_duration,
                                             attempts,
+                                            limiter.as_ref(),
                                         )
                                         .await
                                         {
@@ -743,6 +785,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                                 false, // don't fetch next on failure
                                                 task_lock_duration,
                                                 new_attempts,
+                                                limiter.as_ref(),
                                             )
                                             .await
                                             {
@@ -911,6 +954,14 @@ impl WorkerBuilder {
     /// Set whether to skip the stalled-job check entirely (default: false).
     pub fn skip_stalled_check(mut self, skip: bool) -> Self {
         self.options.skip_stalled_check = skip;
+        self
+    }
+
+    /// Set the rate limiter: process at most `max` jobs per `duration` window
+    /// (default: no limit). The limit is shared across all workers of the queue,
+    /// including Node.js BullMQ workers.
+    pub fn limiter(mut self, limiter: RateLimiterOptions) -> Self {
+        self.options.limiter = Some(limiter);
         self
     }
 

@@ -121,6 +121,18 @@ impl BackoffStrategy {
     }
 }
 
+/// Rate limiter options for a worker.
+///
+/// Limits the number of jobs moved to active per `duration` window, matching
+/// the BullMQ Node.js `limiter` worker option (shared `limiter` key in Redis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimiterOptions {
+    /// Maximum number of jobs processed per window.
+    pub max: u64,
+    /// Length of the rate-limit window.
+    pub duration: Duration,
+}
+
 /// Options for creating a worker.
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
@@ -134,6 +146,8 @@ pub struct WorkerOptions {
     pub max_stalled_count: u32,
     /// Whether to skip the stalled-job check entirely. Default is false.
     pub skip_stalled_check: bool,
+    /// Rate limiter: max jobs per duration window. Default is `None` (no limit).
+    pub limiter: Option<RateLimiterOptions>,
 }
 
 impl Default for WorkerOptions {
@@ -144,6 +158,7 @@ impl Default for WorkerOptions {
             stalled_interval: Duration::from_secs(30),
             max_stalled_count: 1,
             skip_stalled_check: false,
+            limiter: None,
         }
     }
 }

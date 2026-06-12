@@ -84,6 +84,7 @@ impl ScriptLoader {
         inc!("getDelayedScore", "getDelayedScore.lua");
         inc!("getTargetQueueList", "getTargetQueueList.lua");
         inc!("getPriorityScore", "getPriorityScore.lua");
+        inc!("getRateLimitTTL", "getRateLimitTTL.lua");
         inc!("moveJobToWait", "moveJobToWait.lua");
         inc!("moveParentToWait", "moveParentToWait.lua");
         inc!("moveParentToWaitIfNeeded", "moveParentToWaitIfNeeded.lua");

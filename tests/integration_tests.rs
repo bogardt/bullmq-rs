@@ -3343,3 +3343,157 @@ async fn test_worker_is_running_and_is_paused_states() {
     assert!(!handle.is_running(), "worker is not running after shutdown");
     handle.wait().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// test_worker_rate_limiter_limits_throughput
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_rate_limiter_limits_throughput() {
+    let queue_name = unique_queue_name();
+    let queue = QueueBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..6 {
+        queue
+            .add(
+                "limited",
+                TestJob {
+                    value: format!("job-{}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let completed = Arc::new(AtomicU64::new(0));
+    let completed_handler = completed.clone();
+
+    let worker = WorkerBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .concurrency(6)
+        .skip_stalled_check(true)
+        .limiter(RateLimiterOptions {
+            max: 2,
+            duration: Duration::from_secs(2),
+        })
+        .build::<TestJob>();
+
+    let handle = worker
+        .start(move |_job| {
+            let completed = completed_handler.clone();
+            async move {
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let after_one_second = completed.load(Ordering::SeqCst);
+    assert!(
+        after_one_second <= 2,
+        "expected at most 2 jobs completed after 1s with limiter max=2/2s, got {}",
+        after_one_second
+    );
+    assert!(
+        after_one_second >= 1,
+        "expected at least 1 job completed after 1s, got 0"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if completed.load(Ordering::SeqCst) >= 6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected all 6 jobs to complete within 10s, got {}",
+            completed.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 6);
+
+    queue.drain().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// test_worker_without_rate_limiter_unchanged
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_without_rate_limiter_unchanged() {
+    let queue_name = unique_queue_name();
+    let queue = QueueBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..6 {
+        queue
+            .add(
+                "unlimited",
+                TestJob {
+                    value: format!("job-{}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let completed = Arc::new(AtomicU64::new(0));
+    let completed_handler = completed.clone();
+
+    let worker = WorkerBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .concurrency(6)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+
+    let handle = worker
+        .start(move |_job| {
+            let completed = completed_handler.clone();
+            async move {
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if completed.load(Ordering::SeqCst) >= 6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected all 6 jobs to complete fast without limiter, got {}",
+            completed.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 6);
+
+    queue.drain().await.unwrap();
+}
