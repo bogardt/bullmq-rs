@@ -84,4 +84,4 @@ pub use types::{
     JobSchedulerTemplate, JobState, Metrics, MetricsMeta, MetricsOptions, RateLimiterOptions,
     RepeatOptions, WorkerOptions,
 };
-pub use worker::{Worker, WorkerBuilder, WorkerHandle};
+pub use worker::{Worker, WorkerBuilder, WorkerEvent, WorkerHandle};

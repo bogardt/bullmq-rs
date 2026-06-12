@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Typed local worker events** — `WorkerEvent` enum (`Active`, `Completed`,
+  `Failed`, `Error`, `Drained`, `Paused`, `Resumed`, `Cancelled`,
+  `RateLimited`) emitted alongside the existing callbacks over a
+  `tokio::sync::broadcast` channel; subscribe with
+  `WorkerHandle::subscribe()`. Process-local equivalent of Node BullMQ's
+  worker-level `EventEmitter`; lagging receivers skip the oldest events
+  (`RecvError::Lagged`).
+
 ## [2.1.0] — 2026-06-12
 
 This release closes the [BullMQ v5 parity roadmap (#4)](https://github.com/bogardt/bullmq-rs/issues/4):
