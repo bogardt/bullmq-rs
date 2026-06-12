@@ -15,7 +15,7 @@ use crate::scripts::commands::{
     pause,
 };
 use crate::scripts::ScriptLoader;
-use crate::types::{JobOptions, JobState, DEFAULT_MAX_EVENTS};
+use crate::types::{JobOptions, JobState, Metrics, DEFAULT_MAX_EVENTS};
 
 /// A typed job queue backed by Redis.
 ///
@@ -741,6 +741,40 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             .await?;
 
         Ok(logs)
+    }
+
+    /// Get queue metrics for a finished state.
+    ///
+    /// `state` must be [`JobState::Completed`] or [`JobState::Failed`].
+    /// `start` and `end` select a range of data points (`0` is the newest,
+    /// `-1` the oldest), mirroring BullMQ's `Queue.getMetrics`.
+    ///
+    /// Metrics are only collected by workers configured with
+    /// [`crate::WorkerBuilder::metrics`].
+    pub async fn get_metrics(
+        &self,
+        state: JobState,
+        start: i64,
+        end: i64,
+    ) -> BullmqResult<Metrics> {
+        if state != JobState::Completed && state != JobState::Failed {
+            return Err(BullmqError::Other(format!(
+                "get_metrics only supports completed or failed states, got: {}",
+                state
+            )));
+        }
+
+        let mut conn = self.conn.clone();
+        get_metrics::get_metrics(
+            &self.scripts,
+            &mut conn,
+            &self.prefix,
+            &self.name,
+            &state.to_string(),
+            start,
+            end,
+        )
+        .await
     }
 
     /// Get the queue name.

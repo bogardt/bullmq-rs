@@ -64,6 +64,7 @@ impl ScriptLoader {
         register!("promote", "promote-9.lua");
         register!("cleanJobsInSet", "cleanJobsInSet-3.lua");
         register!("obliterate", "obliterate-2.lua");
+        register!("getMetrics", "getMetrics-2.lua");
 
         Self { scripts }
     }
@@ -78,6 +79,8 @@ impl ScriptLoader {
                 );
             };
         }
+        inc!("batches", "batches.lua");
+        inc!("collectMetrics", "collectMetrics.lua");
         inc!("storeJob", "storeJob.lua");
         inc!("addJobInTargetList", "addJobInTargetList.lua");
         inc!("addJobWithPriority", "addJobWithPriority.lua");
