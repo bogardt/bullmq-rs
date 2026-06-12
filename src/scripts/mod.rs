@@ -62,6 +62,7 @@ impl ScriptLoader {
         register!("addLog", "addLog-2.lua");
         register!("changePriority", "changePriority-7.lua");
         register!("promote", "promote-9.lua");
+        register!("getMetrics", "getMetrics-2.lua");
 
         Self { scripts }
     }
@@ -76,6 +77,8 @@ impl ScriptLoader {
                 );
             };
         }
+        inc!("batches", "batches.lua");
+        inc!("collectMetrics", "collectMetrics.lua");
         inc!("storeJob", "storeJob.lua");
         inc!("addJobInTargetList", "addJobInTargetList.lua");
         inc!("addJobWithPriority", "addJobWithPriority.lua");
@@ -182,6 +185,7 @@ mod tests {
         assert!(loader.scripts.contains_key("addLog"));
         assert!(loader.scripts.contains_key("changePriority"));
         assert!(loader.scripts.contains_key("promote"));
-        assert_eq!(loader.scripts.len(), 14);
+        assert!(loader.scripts.contains_key("getMetrics"));
+        assert_eq!(loader.scripts.len(), 15);
     }
 }
