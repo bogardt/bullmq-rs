@@ -6,7 +6,7 @@ pub(crate) mod add_standard_job;
 pub(crate) mod change_priority;
 pub(crate) mod clean_jobs_in_set;
 pub(crate) mod extend_lock;
-pub(crate) mod get_metrics;
+pub(crate) mod move_jobs_to_wait;
 pub(crate) mod move_stalled_jobs_to_wait;
 pub(crate) mod move_to_active;
 pub(crate) mod move_to_delayed;
