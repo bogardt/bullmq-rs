@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::RedisConnection;
@@ -36,6 +36,46 @@ const CANCEL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Registry of cancellation tokens for in-flight jobs, keyed by job id.
 type Cancellations = Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>;
+
+/// Process-local worker lifecycle events, broadcast to every receiver
+/// obtained via [`WorkerHandle::subscribe`].
+///
+/// This is the typed, Rust-idiomatic equivalent of Node BullMQ's worker-level
+/// `EventEmitter` (`worker.on('completed' | 'failed' | ...)`). Events are
+/// delivered over a [`tokio::sync::broadcast`] channel: a receiver that falls
+/// behind the channel capacity misses the oldest events and observes
+/// [`tokio::sync::broadcast::error::RecvError::Lagged`] before resuming. For
+/// cross-process events use [`QueueEvents`](crate::QueueEvents) instead.
+#[derive(Debug, Clone)]
+pub enum WorkerEvent {
+    /// A job was fetched and processing starts.
+    Active { job: Job<serde_json::Value> },
+    /// A job completed successfully.
+    Completed { job: Job<serde_json::Value> },
+    /// A job failed (per delivery — fires on retryable failures too, like the
+    /// `on_failed` callback).
+    Failed {
+        job: Job<serde_json::Value>,
+        reason: String,
+    },
+    /// Internal worker error (fetch loop, moveToActive, BZPOPMIN failures).
+    Error { message: String },
+    /// The worker found no more jobs to fetch (queue drained from this
+    /// worker's perspective).
+    Drained,
+    /// Worker-local pause ([`WorkerHandle::pause`]).
+    Paused,
+    /// Worker-local resume ([`WorkerHandle::resume`]).
+    Resumed,
+    /// A job's processing future was cancelled via
+    /// [`WorkerHandle::cancel_job`].
+    Cancelled { job_id: String },
+    /// The worker is rate limited; next fetch attempt at the embedded TTL
+    /// (milliseconds).
+    RateLimited { ttl_ms: u64 },
+}
+
+const EVENTS_CHANNEL_CAPACITY: usize = 1024;
 
 /// A worker that processes jobs from a queue.
 ///
@@ -90,10 +130,22 @@ pub struct WorkerHandle {
     cancellations: Cancellations,
     conn: redis::aio::ConnectionManager,
     limiter_key: String,
+    events_tx: broadcast::Sender<WorkerEvent>,
     join_handle: tokio::task::JoinHandle<()>,
 }
 
 impl WorkerHandle {
+    /// Subscribe to this worker's local [`WorkerEvent`] stream.
+    ///
+    /// Each call returns an independent receiver; every subscriber sees every
+    /// event emitted after it subscribed. A slow receiver that lags behind
+    /// the channel capacity misses the oldest events and gets
+    /// [`tokio::sync::broadcast::error::RecvError::Lagged`] before catching
+    /// up — emission never blocks the worker.
+    pub fn subscribe(&self) -> broadcast::Receiver<WorkerEvent> {
+        self.events_tx.subscribe()
+    }
+
     /// Pause the worker: stop fetching new jobs from the queue.
     ///
     /// Jobs already fetched keep processing. If `do_not_wait_active` is
@@ -103,7 +155,10 @@ impl WorkerHandle {
     /// This is local to the worker and does not pause the queue itself —
     /// other workers keep processing. Use `Queue::pause` for global pause.
     pub async fn pause(&self, do_not_wait_active: bool) {
-        let _ = self.paused_tx.send(true);
+        let was_paused = self.paused_tx.send_replace(true);
+        if !was_paused {
+            let _ = self.events_tx.send(WorkerEvent::Paused);
+        }
 
         if do_not_wait_active {
             return;
@@ -123,7 +178,10 @@ impl WorkerHandle {
 
     /// Resume fetching jobs after a [`pause`](Self::pause).
     pub fn resume(&self) {
-        let _ = self.paused_tx.send(false);
+        let was_paused = self.paused_tx.send_replace(false);
+        if was_paused {
+            let _ = self.events_tx.send(WorkerEvent::Resumed);
+        }
     }
 
     /// Whether the worker is currently paused.
@@ -163,6 +221,9 @@ impl WorkerHandle {
         match token {
             Some(token) => {
                 token.cancel();
+                let _ = self.events_tx.send(WorkerEvent::Cancelled {
+                    job_id: job_id.to_string(),
+                });
                 true
             }
             None => false,
@@ -254,6 +315,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         // Cancellation signals for in-flight jobs (used by cancel_job).
         let cancellations: Cancellations = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        let (events_tx, _) = broadcast::channel::<WorkerEvent>(EVENTS_CHANNEL_CAPACITY);
+
         // Shutdown channel.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -294,6 +357,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         let cancellations_handle = cancellations.clone();
         let handle_conn = cmd_conn.clone();
         let limiter_key = format!("{}:{}:limiter", prefix, name);
+        let handle_events_tx = events_tx.clone();
 
         let join_handle = tokio::spawn({
             let scripts = scripts.clone();
@@ -302,6 +366,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             let token = token.clone();
             let active_jobs = active_jobs.clone();
             let cancellations = cancellations.clone();
+            let events_tx = events_tx.clone();
             let shutdown_rx_main = shutdown_rx.clone();
             let paused_rx_main = paused_rx.clone();
             let prefetched = prefetched.clone();
@@ -417,6 +482,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                 let mut paused_rx = paused_rx_main;
                 let mut blocking_conn = blocking_conn;
                 let mut cmd_conn = cmd_conn;
+                let mut was_drained = false;
                 let marker_key = format!("{}:{}:marker", prefix, name);
 
                 // Bootstrap: add a marker so BZPOPMIN picks up pre-existing jobs.
@@ -509,6 +575,11 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                 if let Some(ref cb) = on_error {
                                     cb(&BullmqError::Other(format!("BZPOPMIN error: {}", e)));
                                 }
+                                if events_tx.receiver_count() > 0 {
+                                    let _ = events_tx.send(WorkerEvent::Error {
+                                        message: format!("BZPOPMIN error: {}", e),
+                                    });
+                                }
                                 tokio::select! {
                                     _ = tokio::time::sleep(Duration::from_secs(1)) => {},
                                     _ = shutdown_rx.changed() => break,
@@ -548,6 +619,11 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             tracing::warn!("moveToActive error: {}", e);
                                             if let Some(ref cb) = on_error {
                                                 cb(&e);
+                                            }
+                                            if events_tx.receiver_count() > 0 {
+                                                let _ = events_tx.send(WorkerEvent::Error {
+                                                    message: format!("moveToActive error: {}", e),
+                                                });
                                             }
                                             None
                                         }
@@ -593,6 +669,14 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             if let Some(ref cb) = on_error {
                                                 cb(&e);
                                             }
+                                            if events_tx.receiver_count() > 0 {
+                                                let _ = events_tx.send(WorkerEvent::Error {
+                                                    message: format!(
+                                                        "moveToActive error after delay: {}",
+                                                        e
+                                                    ),
+                                                });
+                                            }
                                             continue;
                                         }
                                     }
@@ -625,6 +709,11 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             if let Some(ref cb) = on_error {
                                                 cb(&e);
                                             }
+                                            if events_tx.receiver_count() > 0 {
+                                                let _ = events_tx.send(WorkerEvent::Error {
+                                                    message: format!("moveToActive error: {}", e),
+                                                });
+                                            }
                                             None
                                         }
                                     }
@@ -654,6 +743,10 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         Some(result)
                                     }
                                     Ok(_) => {
+                                        if !was_drained {
+                                            was_drained = true;
+                                            let _ = events_tx.send(WorkerEvent::Drained);
+                                        }
                                         continue;
                                     }
                                     Err(e) => {
@@ -668,6 +761,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                     // If we have a job result from moveToActive, process it.
                     if let Some(result) = move_result {
                         if let Some(ttl) = result.rate_limit_ttl {
+                            let _ = events_tx.send(WorkerEvent::RateLimited { ttl_ms: ttl });
                             // Rate limited: sleep until the limiter window expires
                             // (bounded; the next moveToActive re-checks the TTL).
                             let wait_ms = ttl.clamp(10, 30_000);
@@ -687,6 +781,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             continue;
                         }
                         if let Some(job_id) = result.job_id {
+                            was_drained = false;
                             // Deserialize the job from the hash data returned by moveToActive.
                             let mut job: Job<T> =
                                 match Job::from_redis_hash(&job_id, &result.job_data) {
@@ -740,6 +835,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             let task_prefetched = prefetched.clone();
                             let task_cancellations = cancellations.clone();
                             let task_limit_until = limit_until.clone();
+                            let task_events_tx = events_tx.clone();
 
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -752,9 +848,13 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                 }
 
                                 // Invoke on_active callback.
-                                if let Some(ref cb) = on_active {
+                                if on_active.is_some() || task_events_tx.receiver_count() > 0 {
                                     if let Ok(val_job) = convert_job_to_value(&job) {
-                                        cb(&val_job);
+                                        if let Some(ref cb) = on_active {
+                                            cb(&val_job);
+                                        }
+                                        let _ = task_events_tx
+                                            .send(WorkerEvent::Active { job: val_job });
                                     }
                                 }
 
@@ -880,9 +980,15 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                         }
 
                                         // Invoke on_completed callback.
-                                        if let Some(ref cb) = on_completed {
+                                        if on_completed.is_some()
+                                            || task_events_tx.receiver_count() > 0
+                                        {
                                             if let Ok(val_job) = convert_job_to_value(&job) {
-                                                cb(&val_job);
+                                                if let Some(ref cb) = on_completed {
+                                                    cb(&val_job);
+                                                }
+                                                let _ = task_events_tx
+                                                    .send(WorkerEvent::Completed { job: val_job });
                                             }
                                         }
 
@@ -987,11 +1093,20 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             }
 
                                             // Invoke on_failed callback even for retries.
-                                            if let Some(ref cb) = on_failed {
+                                            if on_failed.is_some()
+                                                || task_events_tx.receiver_count() > 0
+                                            {
                                                 if let Ok(val_job) = convert_job_to_value(&job) {
-                                                    let bullmq_err =
-                                                        BullmqError::Other(err.to_string());
-                                                    cb(&val_job, &bullmq_err);
+                                                    if let Some(ref cb) = on_failed {
+                                                        let bullmq_err =
+                                                            BullmqError::Other(err.to_string());
+                                                        cb(&val_job, &bullmq_err);
+                                                    }
+                                                    let _ =
+                                                        task_events_tx.send(WorkerEvent::Failed {
+                                                            job: val_job,
+                                                            reason: err.to_string(),
+                                                        });
                                                 }
                                             }
                                         } else {
@@ -1053,11 +1168,20 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             }
 
                                             // Invoke on_failed callback.
-                                            if let Some(ref cb) = on_failed {
+                                            if on_failed.is_some()
+                                                || task_events_tx.receiver_count() > 0
+                                            {
                                                 if let Ok(val_job) = convert_job_to_value(&job) {
-                                                    let bullmq_err =
-                                                        BullmqError::Other(err.to_string());
-                                                    cb(&val_job, &bullmq_err);
+                                                    if let Some(ref cb) = on_failed {
+                                                        let bullmq_err =
+                                                            BullmqError::Other(err.to_string());
+                                                        cb(&val_job, &bullmq_err);
+                                                    }
+                                                    let _ =
+                                                        task_events_tx.send(WorkerEvent::Failed {
+                                                            job: val_job,
+                                                            reason: err.to_string(),
+                                                        });
                                                 }
                                             }
 
@@ -1106,6 +1230,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             cancellations: cancellations_handle,
             conn: handle_conn,
             limiter_key,
+            events_tx: handle_events_tx,
             join_handle,
         })
     }

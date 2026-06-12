@@ -5644,3 +5644,294 @@ async fn test_worker_on_error_fires_and_worker_recovers() {
     handle.wait().await.unwrap();
     queue.drain().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Worker local event broadcast (WorkerHandle::subscribe)
+// ---------------------------------------------------------------------------
+
+fn spawn_event_collector(
+    mut rx: tokio::sync::broadcast::Receiver<WorkerEvent>,
+) -> Arc<Mutex<Vec<WorkerEvent>>> {
+    let events: Arc<Mutex<Vec<WorkerEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => sink.lock().await.push(ev),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    events
+}
+
+async fn wait_for_event(
+    events: &Arc<Mutex<Vec<WorkerEvent>>>,
+    timeout: Duration,
+    what: &str,
+    predicate: impl Fn(&WorkerEvent) -> bool,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if events.lock().await.iter().any(&predicate) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} event should arrive within {:?}",
+            what,
+            timeout
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_events_lifecycle() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+
+    let events = spawn_event_collector(handle.subscribe());
+
+    let job = queue
+        .add(
+            "evt",
+            TestJob {
+                value: "events".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_event(
+        &events,
+        Duration::from_secs(10),
+        "Completed",
+        |e| matches!(e, WorkerEvent::Completed { job: j } if j.id == job.id),
+    )
+    .await;
+
+    let evs = events.lock().await;
+    let active_idx = evs
+        .iter()
+        .position(|e| matches!(e, WorkerEvent::Active { job: j } if j.id == job.id))
+        .expect("Active event for the job");
+    let completed_idx = evs
+        .iter()
+        .position(|e| matches!(e, WorkerEvent::Completed { job: j } if j.id == job.id))
+        .expect("Completed event for the job");
+    assert!(active_idx < completed_idx, "Active must precede Completed");
+    drop(evs);
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_events_failed() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker
+        .start(|_job| async move { Err("boom".into()) })
+        .await
+        .unwrap();
+
+    let events = spawn_event_collector(handle.subscribe());
+
+    let job = queue
+        .add(
+            "failing",
+            TestJob {
+                value: "fail-me".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    wait_for_event(&events, Duration::from_secs(10), "Failed", |e| {
+        matches!(
+            e,
+            WorkerEvent::Failed { job: j, reason } if j.id == job.id && reason.contains("boom")
+        )
+    })
+    .await;
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_events_paused_resumed_drained() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+
+    let events = spawn_event_collector(handle.subscribe());
+
+    // Empty queue: the BZPOPMIN timeout (5s) plus the moveToActive recovery
+    // check must produce a single Drained.
+    wait_for_event(&events, Duration::from_secs(15), "Drained", |e| {
+        matches!(e, WorkerEvent::Drained)
+    })
+    .await;
+
+    handle.pause(false).await;
+    wait_for_event(&events, Duration::from_secs(5), "Paused", |e| {
+        matches!(e, WorkerEvent::Paused)
+    })
+    .await;
+
+    handle.resume();
+    wait_for_event(&events, Duration::from_secs(5), "Resumed", |e| {
+        matches!(e, WorkerEvent::Resumed)
+    })
+    .await;
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_events_cancelled() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .add(
+            "slow",
+            TestJob {
+                value: "cancel-me".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker
+        .start_with_signal(|_job, token| async move {
+            tokio::select! {
+                _ = token.cancelled() => Err("cancelled".into()),
+                _ = tokio::time::sleep(Duration::from_secs(10)) => Ok(()),
+            }
+        })
+        .await
+        .unwrap();
+
+    let events = spawn_event_collector(handle.subscribe());
+
+    wait_for_event(
+        &events,
+        Duration::from_secs(10),
+        "Active",
+        |e| matches!(e, WorkerEvent::Active { job: j } if j.id == job.id),
+    )
+    .await;
+
+    assert!(
+        handle.cancel_job(&job.id),
+        "cancel_job should signal the job"
+    );
+
+    wait_for_event(
+        &events,
+        Duration::from_secs(5),
+        "Cancelled",
+        |e| matches!(e, WorkerEvent::Cancelled { job_id } if *job_id == job.id),
+    )
+    .await;
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_worker_events_multiple_subscribers() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(redis_conn())
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+
+    let events_a = spawn_event_collector(handle.subscribe());
+    let events_b = spawn_event_collector(handle.subscribe());
+
+    let job = queue
+        .add(
+            "fanout",
+            TestJob {
+                value: "both".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    for (name, events) in [("first", &events_a), ("second", &events_b)] {
+        wait_for_event(
+            events,
+            Duration::from_secs(10),
+            name,
+            |e| matches!(e, WorkerEvent::Completed { job: j } if j.id == job.id),
+        )
+        .await;
+    }
+
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    queue.drain().await.unwrap();
+}

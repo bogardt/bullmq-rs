@@ -68,6 +68,10 @@ flow behavior needed for real interoperability between Rust and Node:
 - `WorkerHandle`: `pause(do_not_wait_active)`, `resume`, `is_paused`,
   `is_running`, `cancel_job`, graceful `shutdown`/`wait`
 - Callbacks: `on_completed`, `on_failed`, `on_active`, `on_error`
+- Typed local worker events: `WorkerHandle::subscribe()` returns a
+  `tokio::sync::broadcast` receiver of `WorkerEvent` (`Active`, `Completed`,
+  `Failed`, `Error`, `Drained`, `Paused`, `Resumed`, `Cancelled`,
+  `RateLimited`)
 
 ### Job options
 
@@ -123,8 +127,10 @@ flow behavior needed for real interoperability between Rust and Node:
 - `cancel_job` aborts the processing future; there is no cooperative
   `AbortSignal` equivalent — the cancelled job is requeued via stalled
   recovery
-- No BullMQ-style listener/event-emitter surface beyond the provided
-  callbacks (use `QueueEvents` for the stream)
+- Node's stringly-typed worker `EventEmitter` is replaced by the typed
+  `WorkerEvent` broadcast (`WorkerHandle::subscribe`); lagging subscribers
+  skip events (broadcast semantics, `RecvError::Lagged`) — use
+  `QueueEvents` for the cross-process stream
 
 ### Advanced Flows surface
 
