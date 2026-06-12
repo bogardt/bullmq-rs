@@ -26,16 +26,19 @@
   ARGV[8]  = jobId
   ARGV[9]  = attempts made
   ARGV[10] = jobKeyPrefix (e.g. "bull:queueName:")
+  ARGV[11] = maxMetricsSize ("" disables metrics collection)
 
   Returns:
     On error: negative integer (-1 = missing job, -2 = missing lock, -6 = token mismatch)
     On success without fetchNext: 0
     On success with fetchNext: array [nextJobId, nextJobData...] or 0
 
-  Ported from BullMQ (stripped: rate limiter, groups, metrics).
+  Ported from BullMQ (stripped: rate limiter, groups).
 ]]
 local rcall = redis.call
 
+--@include "batches"
+--@include "collectMetrics"
 --@include "removeLock"
 --@include "addBaseMarkerIfNeeded"
 --@include "addJobInTargetList"
@@ -76,6 +79,7 @@ local lockDuration = tonumber(ARGV[7])
 local jobId = ARGV[8]
 local attemptsMade = ARGV[9]
 local jobKeyPrefix = ARGV[10]
+local maxMetricsSize = ARGV[11] or ""
 
 -- 1. Check the job still exists
 if rcall("EXISTS", jobKey) ~= 1 then
@@ -143,6 +147,12 @@ rcall("XADD", eventsKey, "MAXLEN", "~", maxEvents, "*",
       "event", targetState, "jobId", jobId,
       targetState == "completed" and "returnvalue" or "failedReason", returnvalue,
       "prev", "active")
+
+-- Collect metrics
+if maxMetricsSize ~= "" then
+  local metricsKey = jobKeyPrefix .. "metrics:" .. targetState
+  collectMetrics(metricsKey, metricsKey .. ':data', maxMetricsSize, timestamp)
+end
 
 -- 7. If fetchNext requested, try to get the next job (same logic as moveToActive)
 if fetchNext == 1 then

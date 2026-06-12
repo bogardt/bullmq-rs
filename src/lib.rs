@@ -78,6 +78,7 @@ pub use queue::{Queue, QueueBuilder};
 pub use queue_events::{QueueEvent, QueueEvents, QueueEventsBuilder};
 pub use queue_events_producer::{QueueEventsProducer, QueueEventsProducerBuilder};
 pub use types::{
-    BackoffStrategy, DeduplicationOptions, JobDependencies, JobOptions, JobState, WorkerOptions,
+    BackoffStrategy, JobDependencies, JobOptions, JobState, Metrics, MetricsMeta, MetricsOptions,
+    WorkerOptions,
 };
 pub use worker::{Worker, WorkerBuilder, WorkerHandle};

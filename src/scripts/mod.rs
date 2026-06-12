@@ -62,6 +62,7 @@ impl ScriptLoader {
         register!("addLog", "addLog-2.lua");
         register!("changePriority", "changePriority-7.lua");
         register!("promote", "promote-9.lua");
+        register!("moveJobsToWait", "moveJobsToWait-8.lua");
 
         Self { scripts }
     }
@@ -76,10 +77,14 @@ impl ScriptLoader {
                 );
             };
         }
+        inc!("batches", "batches.lua");
+        inc!("collectMetrics", "collectMetrics.lua");
         inc!("storeJob", "storeJob.lua");
         inc!("addJobInTargetList", "addJobInTargetList.lua");
         inc!("addJobWithPriority", "addJobWithPriority.lua");
         inc!("addBaseMarkerIfNeeded", "addBaseMarkerIfNeeded.lua");
+        inc!("batches", "batches.lua");
+        inc!("getOrSetMaxEvents", "getOrSetMaxEvents.lua");
         inc!("addDelayMarkerIfNeeded", "addDelayMarkerIfNeeded.lua");
         inc!("deduplicateJob", "deduplicateJob.lua");
         inc!(
@@ -99,6 +104,25 @@ impl ScriptLoader {
         inc!("promoteDelayedJobs", "promoteDelayedJobs.lua");
         inc!("removeLock", "removeLock.lua");
         inc!("updateParentDepsIfNeeded", "updateParentDepsIfNeeded.lua");
+        inc!("batches", "batches.lua");
+        inc!("getTimestamp", "getTimestamp.lua");
+        inc!("getJobsInZset", "getJobsInZset.lua");
+        inc!("getZSetItems", "getZSetItems.lua");
+        inc!("isJobSchedulerJob", "isJobSchedulerJob.lua");
+        inc!("removeJobKeys", "removeJobKeys.lua");
+        inc!(
+            "removeDeduplicationKeyIfNeededOnRemoval",
+            "removeDeduplicationKeyIfNeededOnRemoval.lua"
+        );
+        inc!("destructureJobKey", "destructureJobKey.lua");
+        inc!("removeParentDependencyKey", "removeParentDependencyKey.lua");
+        inc!("removeJob", "removeJob.lua");
+        inc!("removeJobs", "removeJobs.lua");
+        inc!("filterOutJobsToIgnore", "filterOutJobsToIgnore.lua");
+        inc!("removeListJobs", "removeListJobs.lua");
+        inc!("removeZSetJobs", "removeZSetJobs.lua");
+        inc!("cleanList", "cleanList.lua");
+        inc!("cleanSet", "cleanSet.lua");
         m
     }
 
@@ -187,6 +211,7 @@ mod tests {
         assert!(loader.scripts.contains_key("addLog"));
         assert!(loader.scripts.contains_key("changePriority"));
         assert!(loader.scripts.contains_key("promote"));
-        assert_eq!(loader.scripts.len(), 14);
+        assert!(loader.scripts.contains_key("moveJobsToWait"));
+        assert_eq!(loader.scripts.len(), 15);
     }
 }
