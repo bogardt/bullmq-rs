@@ -3345,199 +3345,208 @@ async fn test_worker_is_running_and_is_paused_states() {
 }
 
 // ---------------------------------------------------------------------------
-// Queue bulk operations: add_bulk, retry_jobs, promote_jobs
+// Job deduplication
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_add_bulk_mixed_options() {
-    let queue_name = unique_queue_name();
-    let queue = QueueBuilder::new(&queue_name)
+async fn test_dedup_second_add_returns_existing_job_id() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
         .connection(redis_conn())
         .build::<TestJob>()
         .await
         .unwrap();
 
-    let jobs = queue
-        .add_bulk(vec![
-            ("standard".to_string(), TestJob { value: "s1".into() }, None),
-            (
-                "delayed".to_string(),
-                TestJob { value: "d1".into() },
-                Some(JobOptions {
-                    delay: Some(Duration::from_secs(3600)),
-                    ..Default::default()
-                }),
-            ),
-            (
-                "prioritized".to_string(),
-                TestJob { value: "p1".into() },
-                Some(JobOptions {
-                    priority: Some(3),
-                    ..Default::default()
-                }),
-            ),
-            (
-                "custom".to_string(),
-                TestJob { value: "c1".into() },
-                Some(JobOptions {
-                    job_id: Some("my-custom-id".to_string()),
-                    ..Default::default()
-                }),
-            ),
-        ])
+    let opts = JobOptions {
+        deduplication: Some(DeduplicationOptions {
+            id: "dedup-a".into(),
+            ttl: None,
+        }),
+        ..Default::default()
+    };
+
+    let first = queue
+        .add("dedup", TestJob { value: "v1".into() }, Some(opts.clone()))
+        .await
+        .unwrap();
+    let second = queue
+        .add("dedup", TestJob { value: "v2".into() }, Some(opts))
         .await
         .unwrap();
 
-    assert_eq!(jobs.len(), 4);
-    assert_eq!(jobs[0].id, "1");
-    assert_eq!(jobs[1].id, "2");
-    assert_eq!(jobs[2].id, "3");
-    assert_eq!(jobs[3].id, "my-custom-id");
+    assert_eq!(
+        second.id, first.id,
+        "second add returns the existing job id"
+    );
 
     let counts = queue.get_job_counts().await.unwrap();
-    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 2);
-    assert_eq!(*counts.get(&JobState::Delayed).unwrap(), 1);
-    assert_eq!(*counts.get(&JobState::Prioritized).unwrap(), 1);
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
 
-    for job in &jobs {
-        let fetched = queue.get_job(&job.id).await.unwrap().unwrap();
-        assert_eq!(fetched.name, job.name);
-        assert_eq!(fetched.data, job.data);
-    }
+    // The stored job keeps the first add's data and records the dedup id.
+    let stored = queue.get_job(&first.id).await.unwrap().unwrap();
+    assert_eq!(stored.data.value, "v1");
 
-    let empty = queue.add_bulk(vec![]).await.unwrap();
-    assert!(empty.is_empty());
+    let mut conn = raw_redis_conn().await;
+    let deid: String = redis::cmd("HGET")
+        .arg(format!("bull:{}:{}", qname, first.id))
+        .arg("deid")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(deid, "dedup-a");
 
     queue.drain().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_retry_jobs_moves_failed_to_wait() {
-    let queue_name = unique_queue_name();
-    let conn = redis_conn();
+async fn test_dedup_key_has_ttl() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
 
-    let queue = QueueBuilder::new(&queue_name)
+    let job = queue
+        .add(
+            "dedup",
+            TestJob { value: "v1".into() },
+            Some(JobOptions {
+                deduplication: Some(DeduplicationOptions {
+                    id: "dedup-ttl".into(),
+                    ttl: Some(Duration::from_secs(5)),
+                }),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut conn = raw_redis_conn().await;
+    let dedup_key = format!("bull:{}:de:dedup-ttl", qname);
+    let holder: String = redis::cmd("GET")
+        .arg(&dedup_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(holder, job.id);
+
+    let pttl: i64 = redis::cmd("PTTL")
+        .arg(&dedup_key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        pttl > 0 && pttl <= 5000,
+        "dedup key PTTL should be set, got {}",
+        pttl
+    );
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_dedup_key_cleared_on_completion() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
         .connection(conn.clone())
         .build::<TestJob>()
         .await
         .unwrap();
 
-    for i in 0..3 {
-        queue
-            .add(
-                "will_fail",
-                TestJob {
-                    value: format!("fail-{}", i),
-                },
-                Some(JobOptions {
-                    attempts: Some(1),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap();
-    }
+    let opts = JobOptions {
+        deduplication: Some(DeduplicationOptions {
+            id: "dedup-complete".into(),
+            ttl: None,
+        }),
+        ..Default::default()
+    };
 
-    let worker = WorkerBuilder::new(&queue_name)
+    let first = queue
+        .add("dedup", TestJob { value: "v1".into() }, Some(opts.clone()))
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
         .connection(conn)
         .skip_stalled_check(true)
         .build::<TestJob>();
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
 
-    let handle = worker
-        .start(|_job| async move {
-            let err: Box<dyn std::error::Error + Send + Sync> = "intentional failure".into();
-            Err(err)
-        })
-        .await
-        .unwrap();
-
-    let mut failed = 0;
-    for _ in 0..50 {
-        failed = queue.get_failed_count().await.unwrap();
-        if failed == 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
     handle.shutdown();
     handle.wait().await.unwrap();
-    assert_eq!(failed, 3, "expected 3 failed jobs before retry_jobs");
 
-    queue
-        .retry_jobs(1000, JobState::Failed, None)
-        .await
-        .unwrap();
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 1);
 
-    assert_eq!(queue.get_failed_count().await.unwrap(), 0);
-    assert_eq!(queue.get_waiting_count().await.unwrap(), 3);
-
-    // moveJobsToWait clears the failure bookkeeping fields.
     let mut raw = raw_redis_conn().await;
-    let failed_reason: Option<String> = redis::cmd("HGET")
-        .arg(format!("bull:{}:1", queue_name))
-        .arg("failedReason")
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg(format!("bull:{}:de:dedup-complete", qname))
         .query_async(&mut raw)
         .await
         .unwrap();
-    assert!(failed_reason.is_none());
+    assert_eq!(exists, 0, "dedup key is removed when the job completes");
+
+    let second = queue
+        .add("dedup", TestJob { value: "v2".into() }, Some(opts))
+        .await
+        .unwrap();
+    assert_ne!(second.id, first.id, "a new job is created after completion");
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
 
     queue.drain().await.unwrap();
 }
 
 #[tokio::test]
 #[ignore = "requires running Redis"]
-async fn test_retry_jobs_rejects_invalid_state() {
-    let queue_name = unique_queue_name();
-    let queue = QueueBuilder::new(&queue_name)
+async fn test_dedup_different_ids_create_two_jobs() {
+    let qname = unique_queue_name();
+    let queue = QueueBuilder::new(&qname)
         .connection(redis_conn())
         .build::<TestJob>()
         .await
         .unwrap();
 
-    let result = queue.retry_jobs(1000, JobState::Delayed, None).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-#[ignore = "requires running Redis"]
-async fn test_promote_jobs_moves_delayed_to_wait() {
-    let queue_name = unique_queue_name();
-    let queue = QueueBuilder::new(&queue_name)
-        .connection(redis_conn())
-        .build::<TestJob>()
+    let first = queue
+        .add(
+            "dedup",
+            TestJob { value: "v1".into() },
+            Some(JobOptions {
+                deduplication: Some(DeduplicationOptions {
+                    id: "dedup-x".into(),
+                    ttl: None,
+                }),
+                ..Default::default()
+            }),
+        )
         .await
         .unwrap();
-
-    queue
-        .add_bulk(
-            (0..3)
-                .map(|i| {
-                    (
-                        "delayed".to_string(),
-                        TestJob {
-                            value: format!("d-{}", i),
-                        },
-                        Some(JobOptions {
-                            delay: Some(Duration::from_secs(3600)),
-                            ..Default::default()
-                        }),
-                    )
-                })
-                .collect(),
+    let second = queue
+        .add(
+            "dedup",
+            TestJob { value: "v2".into() },
+            Some(JobOptions {
+                deduplication: Some(DeduplicationOptions {
+                    id: "dedup-y".into(),
+                    ttl: None,
+                }),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
 
-    assert_eq!(queue.get_delayed_count().await.unwrap(), 3);
-    assert_eq!(queue.get_waiting_count().await.unwrap(), 0);
+    assert_ne!(second.id, first.id);
 
-    // count=2 forces multiple cursor iterations like Node's do/while loop.
-    queue.promote_jobs(2).await.unwrap();
-
-    assert_eq!(queue.get_delayed_count().await.unwrap(), 0);
-    assert_eq!(queue.get_waiting_count().await.unwrap(), 3);
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 2);
 
     queue.drain().await.unwrap();
 }

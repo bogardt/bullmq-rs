@@ -157,6 +157,12 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
     /// - otherwise uses `addStandardJob`
     ///
     /// Returns the created job with its assigned ID.
+    ///
+    /// When [`JobOptions::deduplication`] is set and a deduplication key
+    /// (`<prefix>:<queue>:de:<id>`) already exists, the add is deduplicated:
+    /// no new job is created and the returned job carries the EXISTING job's
+    /// ID (mirroring BullMQ Node, where `Queue.add` returns a job whose `id`
+    /// is the deduplicated job's id).
     pub async fn add(&self, name: &str, data: T, opts: Option<JobOptions>) -> BullmqResult<Job<T>> {
         let mut conn = self.conn.clone();
 
@@ -185,7 +191,15 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
         let opts_json = serde_json::to_string(&job.opts)?;
         let timestamp = job.timestamp;
 
-        if job.delay > 0 {
+        let dedup_key = job
+            .opts
+            .deduplication
+            .as_ref()
+            .map(|d| self.key(&format!("de:{}", d.id)))
+            .unwrap_or_default();
+
+        let returned_id = if job.delay > 0 {
+            // Delayed job: compute the delayed timestamp.
             let delayed_timestamp = timestamp + job.delay;
             add_delayed_job::add_delayed_job(
                 &self.scripts,
@@ -199,8 +213,9 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
                 &opts_json,
                 DEFAULT_MAX_EVENTS,
                 delayed_timestamp,
+                &dedup_key,
             )
-            .await?;
+            .await?
         } else if job.priority > 0 {
             add_prioritized_job::add_prioritized_job(
                 &self.scripts,
@@ -213,8 +228,9 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
                 timestamp,
                 &opts_json,
                 DEFAULT_MAX_EVENTS,
+                &dedup_key,
             )
-            .await?;
+            .await?
         } else {
             add_standard_job::add_standard_job(
                 &self.scripts,
@@ -227,12 +243,14 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
                 timestamp,
                 &opts_json,
                 DEFAULT_MAX_EVENTS,
+                &dedup_key,
             )
-            .await?;
-        }
+            .await?
+        };
 
-        Ok(())
-    }
+        let mut job = job;
+        job.id = returned_id;
+        job.ctx = Some(self.job_context());
 
     /// Add multiple jobs to the queue.
     ///

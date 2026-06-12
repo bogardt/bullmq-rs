@@ -52,6 +52,7 @@ local rcall = redis.call
 --@include "moveParentToWaitIfNoPendingDependencies"
 --@include "updateParentDepsIfNeeded"
 --@include "promoteDelayedJobs"
+--@include "removeDeduplicationKeyIfNeededOnFinalization"
 
 local waitKey = KEYS[1]
 local activeKey = KEYS[2]
@@ -93,6 +94,9 @@ end
 
 -- 3. Remove from active list
 rcall("LREM", activeKey, 1, jobId)
+
+local deduplicationId = rcall("HGET", jobKey, "deid")
+removeDeduplicationKeyIfNeededOnFinalization(jobKeyPrefix, deduplicationId, jobId)
 
 -- 4. Add to finished set (scored by timestamp)
 rcall("ZADD", finishedKey, timestamp, jobId)

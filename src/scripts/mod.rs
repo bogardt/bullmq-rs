@@ -86,6 +86,11 @@ impl ScriptLoader {
         inc!("batches", "batches.lua");
         inc!("getOrSetMaxEvents", "getOrSetMaxEvents.lua");
         inc!("addDelayMarkerIfNeeded", "addDelayMarkerIfNeeded.lua");
+        inc!("deduplicateJob", "deduplicateJob.lua");
+        inc!(
+            "removeDeduplicationKeyIfNeededOnFinalization",
+            "removeDeduplicationKeyIfNeededOnFinalization.lua"
+        );
         inc!("getDelayedScore", "getDelayedScore.lua");
         inc!("getTargetQueueList", "getTargetQueueList.lua");
         inc!("getPriorityScore", "getPriorityScore.lua");
