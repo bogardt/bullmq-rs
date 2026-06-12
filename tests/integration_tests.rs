@@ -3343,3 +3343,332 @@ async fn test_worker_is_running_and_is_paused_states() {
     assert!(!handle.is_running(), "worker is not running after shutdown");
     handle.wait().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Queue clean / obliterate
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_wait_jobs() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        queue
+            .add(
+                "to_clean",
+                TestJob {
+                    value: format!("job {}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let removed = queue
+        .clean(Duration::from_secs(0), 0, JobState::Wait)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 3);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 0);
+
+    // Job hashes must be gone.
+    let mut raw = raw_redis_conn().await;
+    for job_id in &removed {
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(format!("bull:{}:{}", qname, job_id))
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert!(!exists, "job hash {} should be deleted", job_id);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_respects_grace_period() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "recent",
+            TestJob {
+                value: "too young to die".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let removed = queue
+        .clean(Duration::from_secs(3600), 0, JobState::Wait)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 0, "job within grace period must be kept");
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_respects_limit() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        queue
+            .add(
+                "limited",
+                TestJob {
+                    value: format!("job {}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let removed = queue
+        .clean(Duration::from_secs(0), 2, JobState::Wait)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 2);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 1);
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_delayed_jobs() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "delayed",
+            TestJob {
+                value: "later".into(),
+            },
+            Some(JobOptions {
+                delay: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    let removed = queue
+        .clean(Duration::from_secs(0), 0, JobState::Delayed)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 1);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Delayed).unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_clean_completed_jobs() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add(
+            "work",
+            TestJob {
+                value: "to be completed then cleaned".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let worker = WorkerBuilder::new(&qname)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+    let handle = worker.start(|_job| async move { Ok(()) }).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    handle.shutdown();
+    handle.wait().await.unwrap();
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 1);
+
+    let removed = queue
+        .clean(Duration::from_secs(0), 0, JobState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(removed.len(), 1);
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Completed).unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_obliterate_removes_everything() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        queue
+            .add(
+                "doomed",
+                TestJob {
+                    value: format!("job {}", i),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    queue
+        .add(
+            "doomed_delayed",
+            TestJob {
+                value: "delayed".into(),
+            },
+            Some(JobOptions {
+                delay: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    queue
+        .add(
+            "doomed_prioritized",
+            TestJob {
+                value: "prioritized".into(),
+            },
+            Some(JobOptions {
+                priority: Some(3u32),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    queue.obliterate(false).await.unwrap();
+
+    // No key of this queue must remain.
+    let mut raw = raw_redis_conn().await;
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("bull:{}:*", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        keys.is_empty(),
+        "obliterate must remove all queue keys, found: {:?}",
+        keys
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_queue_obliterate_fails_with_active_jobs_unless_forced() {
+    let conn = redis_conn();
+    let qname = unique_queue_name();
+
+    let queue = QueueBuilder::new(&qname)
+        .connection(conn)
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let job = queue
+        .add(
+            "active_job",
+            TestJob {
+                value: "in flight".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Simulate an active job: move the id from wait to active.
+    let mut raw = raw_redis_conn().await;
+    let _: () = redis::cmd("LREM")
+        .arg(format!("bull:{}:wait", qname))
+        .arg(0)
+        .arg(&job.id)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("LPUSH")
+        .arg(format!("bull:{}:active", qname))
+        .arg(&job.id)
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+
+    let result = queue.obliterate(false).await;
+    assert!(
+        result.is_err(),
+        "obliterate without force must fail with active jobs"
+    );
+
+    queue.obliterate(true).await.unwrap();
+
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg(format!("bull:{}:*", qname))
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(
+        keys.is_empty(),
+        "forced obliterate must remove all queue keys, found: {:?}",
+        keys
+    );
+}
