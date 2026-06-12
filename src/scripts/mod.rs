@@ -62,6 +62,7 @@ impl ScriptLoader {
         register!("addLog", "addLog-2.lua");
         register!("changePriority", "changePriority-7.lua");
         register!("promote", "promote-9.lua");
+        register!("moveJobsToWait", "moveJobsToWait-8.lua");
 
         Self { scripts }
     }
@@ -80,6 +81,8 @@ impl ScriptLoader {
         inc!("addJobInTargetList", "addJobInTargetList.lua");
         inc!("addJobWithPriority", "addJobWithPriority.lua");
         inc!("addBaseMarkerIfNeeded", "addBaseMarkerIfNeeded.lua");
+        inc!("batches", "batches.lua");
+        inc!("getOrSetMaxEvents", "getOrSetMaxEvents.lua");
         inc!("addDelayMarkerIfNeeded", "addDelayMarkerIfNeeded.lua");
         inc!("getDelayedScore", "getDelayedScore.lua");
         inc!("getTargetQueueList", "getTargetQueueList.lua");
@@ -182,6 +185,7 @@ mod tests {
         assert!(loader.scripts.contains_key("addLog"));
         assert!(loader.scripts.contains_key("changePriority"));
         assert!(loader.scripts.contains_key("promote"));
-        assert_eq!(loader.scripts.len(), 14);
+        assert!(loader.scripts.contains_key("moveJobsToWait"));
+        assert_eq!(loader.scripts.len(), 15);
     }
 }

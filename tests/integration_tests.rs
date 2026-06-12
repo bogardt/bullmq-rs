@@ -3343,3 +3343,201 @@ async fn test_worker_is_running_and_is_paused_states() {
     assert!(!handle.is_running(), "worker is not running after shutdown");
     handle.wait().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Queue bulk operations: add_bulk, retry_jobs, promote_jobs
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_add_bulk_mixed_options() {
+    let queue_name = unique_queue_name();
+    let queue = QueueBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let jobs = queue
+        .add_bulk(vec![
+            ("standard".to_string(), TestJob { value: "s1".into() }, None),
+            (
+                "delayed".to_string(),
+                TestJob { value: "d1".into() },
+                Some(JobOptions {
+                    delay: Some(Duration::from_secs(3600)),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "prioritized".to_string(),
+                TestJob { value: "p1".into() },
+                Some(JobOptions {
+                    priority: Some(3),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "custom".to_string(),
+                TestJob { value: "c1".into() },
+                Some(JobOptions {
+                    job_id: Some("my-custom-id".to_string()),
+                    ..Default::default()
+                }),
+            ),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(jobs.len(), 4);
+    assert_eq!(jobs[0].id, "1");
+    assert_eq!(jobs[1].id, "2");
+    assert_eq!(jobs[2].id, "3");
+    assert_eq!(jobs[3].id, "my-custom-id");
+
+    let counts = queue.get_job_counts().await.unwrap();
+    assert_eq!(*counts.get(&JobState::Wait).unwrap(), 2);
+    assert_eq!(*counts.get(&JobState::Delayed).unwrap(), 1);
+    assert_eq!(*counts.get(&JobState::Prioritized).unwrap(), 1);
+
+    for job in &jobs {
+        let fetched = queue.get_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(fetched.name, job.name);
+        assert_eq!(fetched.data, job.data);
+    }
+
+    let empty = queue.add_bulk(vec![]).await.unwrap();
+    assert!(empty.is_empty());
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_retry_jobs_moves_failed_to_wait() {
+    let queue_name = unique_queue_name();
+    let conn = redis_conn();
+
+    let queue = QueueBuilder::new(&queue_name)
+        .connection(conn.clone())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        queue
+            .add(
+                "will_fail",
+                TestJob {
+                    value: format!("fail-{}", i),
+                },
+                Some(JobOptions {
+                    attempts: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    let worker = WorkerBuilder::new(&queue_name)
+        .connection(conn)
+        .skip_stalled_check(true)
+        .build::<TestJob>();
+
+    let handle = worker
+        .start(|_job| async move {
+            let err: Box<dyn std::error::Error + Send + Sync> = "intentional failure".into();
+            Err(err)
+        })
+        .await
+        .unwrap();
+
+    let mut failed = 0;
+    for _ in 0..50 {
+        failed = queue.get_failed_count().await.unwrap();
+        if failed == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    handle.shutdown();
+    handle.wait().await.unwrap();
+    assert_eq!(failed, 3, "expected 3 failed jobs before retry_jobs");
+
+    queue
+        .retry_jobs(1000, JobState::Failed, None)
+        .await
+        .unwrap();
+
+    assert_eq!(queue.get_failed_count().await.unwrap(), 0);
+    assert_eq!(queue.get_waiting_count().await.unwrap(), 3);
+
+    // moveJobsToWait clears the failure bookkeeping fields.
+    let mut raw = raw_redis_conn().await;
+    let failed_reason: Option<String> = redis::cmd("HGET")
+        .arg(format!("bull:{}:1", queue_name))
+        .arg("failedReason")
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert!(failed_reason.is_none());
+
+    queue.drain().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_retry_jobs_rejects_invalid_state() {
+    let queue_name = unique_queue_name();
+    let queue = QueueBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    let result = queue.retry_jobs(1000, JobState::Delayed, None).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires running Redis"]
+async fn test_promote_jobs_moves_delayed_to_wait() {
+    let queue_name = unique_queue_name();
+    let queue = QueueBuilder::new(&queue_name)
+        .connection(redis_conn())
+        .build::<TestJob>()
+        .await
+        .unwrap();
+
+    queue
+        .add_bulk(
+            (0..3)
+                .map(|i| {
+                    (
+                        "delayed".to_string(),
+                        TestJob {
+                            value: format!("d-{}", i),
+                        },
+                        Some(JobOptions {
+                            delay: Some(Duration::from_secs(3600)),
+                            ..Default::default()
+                        }),
+                    )
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(queue.get_delayed_count().await.unwrap(), 3);
+    assert_eq!(queue.get_waiting_count().await.unwrap(), 0);
+
+    // count=2 forces multiple cursor iterations like Node's do/while loop.
+    queue.promote_jobs(2).await.unwrap();
+
+    assert_eq!(queue.get_delayed_count().await.unwrap(), 0);
+    assert_eq!(queue.get_waiting_count().await.unwrap(), 3);
+
+    queue.drain().await.unwrap();
+}
