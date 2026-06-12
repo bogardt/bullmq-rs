@@ -82,6 +82,8 @@ pub struct Job<T> {
     pub return_value: Option<serde_json::Value>,
     /// Identifier of the worker that processed this job. Maps to "pb" in the Redis hash.
     pub processed_by: Option<String>,
+    /// Id of the job scheduler that produced this job. Maps to "rjk" in the Redis hash.
+    pub repeat_job_key: Option<String>,
     /// Connection context injected by Queue/Worker. None for manually-created jobs.
     #[serde(skip)]
     pub(crate) ctx: Option<Arc<JobContext>>,
@@ -118,6 +120,7 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             stacktrace: Vec::new(),
             return_value: None,
             processed_by: None,
+            repeat_job_key: None,
             ctx: None,
             lock_token: None,
         }
@@ -169,6 +172,9 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
         }
         if let Some(ref pb) = self.processed_by {
             fields.push(("pb".into(), pb.clone()));
+        }
+        if let Some(ref rjk) = self.repeat_job_key {
+            fields.push(("rjk".into(), rjk.clone()));
         }
 
         Ok(fields)
@@ -246,6 +252,7 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             .transpose()?
             .unwrap_or_default();
         let processed_by = map.get("pb").cloned();
+        let repeat_job_key = map.get("rjk").cloned();
 
         // Determine state: prefer explicit "state" field, otherwise infer Wait.
         let state: JobState = match map.get("state") {
@@ -271,6 +278,7 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             stacktrace,
             return_value,
             processed_by,
+            repeat_job_key,
             ctx: None,
             lock_token: None,
         })
@@ -623,6 +631,61 @@ impl<T: Serialize + DeserializeOwned> Job<T> {
             self.priority,
         )
         .await
+    }
+
+    /// Move this active job to the completed set.
+    ///
+    /// Only valid for jobs holding a lock token, i.e. jobs obtained via
+    /// [`crate::Queue::get_next_job`] (or inside a worker handler). The
+    /// `return_value` is stored in the `returnvalue` hash field.
+    pub async fn move_to_completed(&mut self, return_value: serde_json::Value) -> BullmqResult<()> {
+        self.move_to_finished_state(&serde_json::to_string(&return_value)?, "completed")
+            .await?;
+        self.return_value = Some(return_value);
+        self.state = JobState::Completed;
+        Ok(())
+    }
+
+    /// Move this active job to the failed set with the given reason.
+    ///
+    /// Only valid for jobs holding a lock token, i.e. jobs obtained via
+    /// [`crate::Queue::get_next_job`] (or inside a worker handler).
+    pub async fn move_to_failed(&mut self, reason: &str) -> BullmqResult<()> {
+        self.move_to_finished_state(reason, "failed").await?;
+        self.failed_reason = Some(reason.to_string());
+        self.state = JobState::Failed;
+        Ok(())
+    }
+
+    async fn move_to_finished_state(&self, result_data: &str, target: &str) -> BullmqResult<()> {
+        let token = self.lock_token.as_deref().ok_or_else(|| {
+            BullmqError::Other(
+                "moving to a finished state requires a lock token (use Queue::get_next_job)".into(),
+            )
+        })?;
+
+        let ctx = self.ctx()?;
+        let mut conn = ctx.conn.clone();
+
+        crate::scripts::commands::move_to_finished::move_to_finished(
+            &ctx.scripts,
+            &mut conn,
+            &ctx.prefix,
+            &ctx.queue_name,
+            &self.id,
+            token,
+            now_ms(),
+            result_data,
+            target,
+            10_000,
+            false,
+            30_000,
+            self.attempts_made + 1,
+            None,
+            None,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Wait until this job is finished (completed or failed).

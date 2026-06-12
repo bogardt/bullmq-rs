@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -22,12 +22,16 @@ type ActiveCallback = Arc<dyn Fn(&Job<serde_json::Value>) + Send + Sync>;
 type ErrorCallback = Arc<dyn Fn(&BullmqError) + Send + Sync>;
 use crate::scripts::commands::{
     extend_lock, move_stalled_jobs_to_wait, move_to_active, move_to_delayed, move_to_finished,
+    update_job_scheduler,
 };
 use crate::scripts::ScriptLoader;
 use crate::types::{MetricsOptions, RateLimiterOptions, WorkerOptions, DEFAULT_MAX_EVENTS};
 
 const MARKER_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_CONN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Registry of cancellation signals for in-flight jobs, keyed by job id.
+type Cancellations = Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
 
 /// A worker that processes jobs from a queue.
 ///
@@ -79,6 +83,7 @@ pub struct WorkerHandle {
     semaphore: Arc<Semaphore>,
     concurrency: usize,
     prefetched: Arc<std::sync::atomic::AtomicUsize>,
+    cancellations: Cancellations,
     join_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -124,6 +129,31 @@ impl WorkerHandle {
     /// A paused worker is still considered running.
     pub fn is_running(&self) -> bool {
         !*self.shutdown_tx.borrow() && !self.join_handle.is_finished()
+    }
+
+    /// Cancel an in-flight job by aborting its processing future.
+    ///
+    /// Returns `true` when the job was being processed by this worker and the
+    /// cancellation signal was delivered, `false` otherwise (unknown job id or
+    /// already finished).
+    ///
+    /// Unlike Node BullMQ — where cancellation is cooperative via an
+    /// `AbortSignal` passed to the processor — the handler future is dropped
+    /// at its next await point and gets no chance to clean up. The job is NOT
+    /// moved to a finished state: it stays in the active list with its lock,
+    /// the lock then expires (this worker stops extending it), and the
+    /// stalled-job checker eventually requeues or fails it according to
+    /// `max_stalled_count`.
+    pub fn cancel_job(&self, job_id: &str) -> bool {
+        let sender = self
+            .cancellations
+            .lock()
+            .expect("cancellations mutex poisoned")
+            .remove(job_id);
+        match sender {
+            Some(tx) => tx.send(()).is_ok(),
+            None => false,
+        }
     }
 
     /// Signal the worker to stop after finishing current jobs.
@@ -174,6 +204,9 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
         // Shared state for active job tracking (used by lock extender).
         let active_jobs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+        // Cancellation signals for in-flight jobs (used by cancel_job).
+        let cancellations: Cancellations = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
         // Shutdown channel.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -207,6 +240,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
 
         let semaphore_handle = semaphore.clone();
         let prefetched_handle = prefetched.clone();
+        let cancellations_handle = cancellations.clone();
 
         let join_handle = tokio::spawn({
             let scripts = scripts.clone();
@@ -214,6 +248,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             let prefix = prefix.clone();
             let token = token.clone();
             let active_jobs = active_jobs.clone();
+            let cancellations = cancellations.clone();
             let shutdown_rx_main = shutdown_rx.clone();
             let paused_rx_main = paused_rx.clone();
             let prefetched = prefetched.clone();
@@ -637,6 +672,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             let task_lock_duration = lock_duration_ms;
                             let task_paused_rx = paused_rx.clone();
                             let task_prefetched = prefetched.clone();
+                            let task_cancellations = cancellations.clone();
 
                             tokio::spawn(async move {
                                 let _permit = permit;
@@ -655,9 +691,35 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                     }
                                 }
 
-                                // Run the user handler.
-                                match handler(job.clone()).await {
-                                    Ok(()) => {
+                                // Run the user handler, racing it against a
+                                // cancellation signal (see WorkerHandle::cancel_job).
+                                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                                task_cancellations
+                                    .lock()
+                                    .expect("cancellations mutex poisoned")
+                                    .insert(job_id.clone(), cancel_tx);
+
+                                let handler_outcome = tokio::select! {
+                                    res = handler(job.clone()) => Some(res),
+                                    _ = cancel_rx => None,
+                                };
+
+                                task_cancellations
+                                    .lock()
+                                    .expect("cancellations mutex poisoned")
+                                    .remove(&job_id);
+
+                                match handler_outcome {
+                                    None => {
+                                        // Cancelled: drop the job without finishing it.
+                                        // Its lock expires once removed from active_jobs
+                                        // below, and the stalled checker requeues it.
+                                        tracing::warn!(
+                                            "Job {} cancelled, it will be recovered by the stalled checker",
+                                            job_id
+                                        );
+                                    }
+                                    Some(Ok(())) => {
                                         // Success: call moveToFinished(completed).
                                         // Skip fetchNext while paused so the pause settles
                                         // instead of prefetching more work.
@@ -723,6 +785,24 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             }
                                         }
 
+                                        if job.repeat_job_key.is_some() {
+                                            if let Err(e) = schedule_next_repeatable_job(
+                                                &scripts,
+                                                &mut task_conn,
+                                                &task_prefix,
+                                                &task_name,
+                                                &job,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(
+                                                    "Failed to schedule next repeatable iteration for job {}: {}",
+                                                    job_id,
+                                                    e
+                                                );
+                                            }
+                                        }
+
                                         // Invoke on_completed callback.
                                         if let Some(ref cb) = on_completed {
                                             if let Ok(val_job) = convert_job_to_value(&job) {
@@ -732,7 +812,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
 
                                         tracing::debug!("Job {} completed", job_id);
                                     }
-                                    Err(err) => {
+                                    Some(Err(err)) => {
                                         let new_attempts = job.attempts_made + 1;
                                         let max_attempts = job.opts.attempts.unwrap_or(1);
 
@@ -836,6 +916,24 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                                 }
                                             }
 
+                                            if job.repeat_job_key.is_some() {
+                                                if let Err(e) = schedule_next_repeatable_job(
+                                                    &scripts,
+                                                    &mut task_conn,
+                                                    &task_prefix,
+                                                    &task_name,
+                                                    &job,
+                                                )
+                                                .await
+                                                {
+                                                    tracing::warn!(
+                                                        "Failed to schedule next repeatable iteration for job {}: {}",
+                                                        job_id,
+                                                        e
+                                                    );
+                                                }
+                                            }
+
                                             // Invoke on_failed callback.
                                             if let Some(ref cb) = on_failed {
                                                 if let Ok(val_job) = convert_job_to_value(&job) {
@@ -887,9 +985,97 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
             semaphore: semaphore_handle,
             concurrency,
             prefetched: prefetched_handle,
+            cancellations: cancellations_handle,
             join_handle,
         })
     }
+}
+
+/// Schedule the next iteration of a job scheduler after one of its jobs
+/// finished, mirroring Node BullMQ's `JobScheduler.upsertJobScheduler` with
+/// `override: false` and `producerId` set to the finished job's id (the Lua
+/// script is a no-op when the scheduler was removed, the producer is stale,
+/// or the next iteration already exists).
+async fn schedule_next_repeatable_job<T: Serialize>(
+    scripts: &ScriptLoader,
+    conn: &mut redis::aio::ConnectionManager,
+    prefix: &str,
+    queue_name: &str,
+    job: &Job<T>,
+) -> BullmqResult<()> {
+    let Some(scheduler_id) = job.repeat_job_key.as_deref() else {
+        return Ok(());
+    };
+
+    // Only v5 job schedulers (storeJobScheduler) write the 'ic' field; this
+    // filters out legacy repeatable keys, which are not supported here.
+    let scheduler_key = format!("{}:{}:repeat:{}", prefix, queue_name, scheduler_id);
+    let is_scheduler: bool = redis::cmd("HEXISTS")
+        .arg(&scheduler_key)
+        .arg("ic")
+        .query_async(conn)
+        .await?;
+    if !is_scheduler {
+        return Ok(());
+    }
+
+    let Some(repeat) = job.opts.repeat.clone() else {
+        return Ok(());
+    };
+
+    let iteration_count = repeat.count.map(|c| c + 1).unwrap_or(1);
+    if let Some(limit) = repeat.limit {
+        if iteration_count > limit {
+            return Ok(());
+        }
+    }
+
+    let mut now = now_ms();
+    if let Some(end_date) = repeat.end_date {
+        if now > end_date {
+            return Ok(());
+        }
+    }
+    let prev_millis = job.opts.prev_millis.unwrap_or(0);
+    if prev_millis > now {
+        now = prev_millis;
+    }
+
+    let next_millis = match &repeat.pattern {
+        Some(pattern) => match crate::repeat::next_pattern_millis(now, &repeat, pattern)? {
+            Some(next) => next.max(now),
+            None => return Ok(()),
+        },
+        // The Lua script computes nextMillis itself in 'every' mode.
+        None if repeat.every.is_some() => 0,
+        None => return Ok(()),
+    };
+
+    let merged_opts = crate::repeat::build_iteration_opts(
+        &job.opts,
+        &repeat,
+        scheduler_id,
+        iteration_count,
+        repeat.pattern.as_ref().map(|_| next_millis),
+    );
+
+    let template_data = serde_json::to_string(&job.data)?;
+    let delayed_opts = serde_json::to_string(&merged_opts)?;
+
+    update_job_scheduler::update_job_scheduler(
+        scripts,
+        conn,
+        prefix,
+        queue_name,
+        scheduler_id,
+        next_millis,
+        &template_data,
+        &delayed_opts,
+        now_ms(),
+        &job.id,
+    )
+    .await?;
+    Ok(())
 }
 
 fn is_bzpopmin_timeout(error: &redis::RedisError) -> bool {
@@ -918,6 +1104,7 @@ fn convert_job_to_value<T: Serialize>(job: &Job<T>) -> BullmqResult<Job<serde_js
         stacktrace: job.stacktrace.clone(),
         return_value: job.return_value.clone(),
         processed_by: job.processed_by.clone(),
+        repeat_job_key: job.repeat_job_key.clone(),
         ctx: None,
         lock_token: None,
     })
