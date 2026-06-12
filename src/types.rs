@@ -155,6 +155,38 @@ pub struct RateLimiterOptions {
     pub duration: Duration,
 }
 
+/// Metrics collection options for a worker.
+///
+/// When set, the worker records per-minute finished-job counts in the
+/// `metrics:<state>` keys, matching the BullMQ Node.js `metrics` worker option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsOptions {
+    /// Maximum number of per-minute data points retained.
+    pub max_data_points: u64,
+}
+
+/// Metadata of collected queue metrics.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsMeta {
+    /// Total number of finished jobs counted.
+    pub count: u64,
+    /// Timestamp (ms) of the last collected data point.
+    pub prev_ts: u64,
+    /// Job count at the last collected data point.
+    pub prev_count: u64,
+}
+
+/// Queue metrics as returned by `Queue::get_metrics`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Metrics {
+    /// Collection metadata.
+    pub meta: MetricsMeta,
+    /// Per-minute data points (newest first).
+    pub data: Vec<i64>,
+    /// Number of data points available.
+    pub count: u64,
+}
+
 /// Options for creating a worker.
 #[derive(Debug, Clone)]
 pub struct WorkerOptions {
@@ -170,6 +202,8 @@ pub struct WorkerOptions {
     pub skip_stalled_check: bool,
     /// Rate limiter: max jobs per duration window. Default is `None` (no limit).
     pub limiter: Option<RateLimiterOptions>,
+    /// Metrics collection. Default is `None` (no metrics collected).
+    pub metrics: Option<MetricsOptions>,
 }
 
 impl Default for WorkerOptions {
@@ -181,6 +215,7 @@ impl Default for WorkerOptions {
             max_stalled_count: 1,
             skip_stalled_check: false,
             limiter: None,
+            metrics: None,
         }
     }
 }

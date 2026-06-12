@@ -36,6 +36,7 @@ pub(crate) async fn move_to_finished(
     lock_duration: u64,
     attempts_made: u32,
     limiter: Option<&RateLimiterOptions>,
+    max_metrics_size: Option<u64>,
 ) -> BullmqResult<MoveToFinishedResult> {
     let job_key = format!("{}:{}:{}", prefix, queue_name, job_id);
     let lock_key = format!("{}:lock", job_key);
@@ -77,6 +78,9 @@ pub(crate) async fn move_to_finished(
         job_key_prefix.into_bytes(),
         limiter_max,
         limiter_duration,
+        max_metrics_size
+            .map(|m| m.to_string().into_bytes())
+            .unwrap_or_default(),
     ];
 
     let result = loader.invoke("moveToFinished", conn, &keys, &args).await?;

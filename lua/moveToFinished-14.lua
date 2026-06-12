@@ -28,6 +28,7 @@
   ARGV[10] = jobKeyPrefix (e.g. "bull:queueName:")
   ARGV[11] = rate limiter max jobs ("" when no limiter)
   ARGV[12] = rate limiter duration in milliseconds ("" when no limiter)
+  ARGV[13] = max metrics data points ("" disables metrics collection)
 
   Returns:
     On error: negative integer (-1 = missing job, -2 = missing lock, -6 = token mismatch)
@@ -35,7 +36,7 @@
     On success with fetchNext: array [nextJobId, nextJobData...] or 0
     When rate limited during fetchNext: {0, 0, rateLimitedNextTtl, 0}
 
-  Ported from BullMQ (stripped: groups, metrics).
+  Ported from BullMQ (stripped: groups).
 ]]
 local rcall = redis.call
 
@@ -84,6 +85,7 @@ local attemptsMade = ARGV[9]
 local jobKeyPrefix = ARGV[10]
 local maxJobs = tonumber(ARGV[11])
 local limiterDuration = tonumber(ARGV[12])
+local maxMetricsSize = ARGV[13]
 
 -- 1. Check the job still exists
 if rcall("EXISTS", jobKey) ~= 1 then

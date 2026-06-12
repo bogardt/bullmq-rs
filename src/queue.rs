@@ -11,7 +11,8 @@ use crate::connection::RedisConnection;
 use crate::error::{BullmqError, BullmqResult};
 use crate::job::{cleanup_job, Job, JobContext};
 use crate::scripts::commands::{
-    add_delayed_job, add_log, add_prioritized_job, add_standard_job, move_jobs_to_wait, pause,
+    add_delayed_job, add_log, add_prioritized_job, add_standard_job, clean_jobs_in_set,
+    get_metrics, move_jobs_to_wait, obliterate, pause,
 };
 use crate::scripts::ScriptLoader;
 use crate::types::{JobOptions, JobState, Metrics, DEFAULT_MAX_EVENTS};
@@ -179,14 +180,21 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
         };
 
         let mut job = Job::new(job_id, name.to_string(), data, opts);
-        self.dispatch_add(&mut conn, &job).await?;
+        job.id = self.dispatch_add(&mut conn, &job).await?;
         job.ctx = Some(self.job_context());
 
         Ok(job)
     }
 
     /// Run the appropriate add script (delayed/prioritized/standard) for a job.
-    async fn dispatch_add(&self, conn: &mut ConnectionManager, job: &Job<T>) -> BullmqResult<()> {
+    ///
+    /// Returns the id assigned by the script — the EXISTING job's id when the
+    /// add was deduplicated, the job's own id otherwise.
+    async fn dispatch_add(
+        &self,
+        conn: &mut ConnectionManager,
+        job: &Job<T>,
+    ) -> BullmqResult<String> {
         let data_json = serde_json::to_string(&job.data)?;
         let opts_json = serde_json::to_string(&job.opts)?;
         let timestamp = job.timestamp;
@@ -248,9 +256,8 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             .await?
         };
 
-        let mut job = job;
-        job.id = returned_id;
-        job.ctx = Some(self.job_context());
+        Ok(returned_id)
+    }
 
     /// Add multiple jobs to the queue.
     ///
@@ -299,7 +306,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Queue<T> {
             };
 
             let mut job = Job::new(job_id, name, data, opts);
-            self.dispatch_add(&mut conn, &job).await?;
+            job.id = self.dispatch_add(&mut conn, &job).await?;
             job.ctx = Some(ctx.clone());
             created.push(job);
         }
