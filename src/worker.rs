@@ -24,7 +24,7 @@ use crate::scripts::commands::{
     extend_lock, move_stalled_jobs_to_wait, move_to_active, move_to_delayed, move_to_finished,
 };
 use crate::scripts::ScriptLoader;
-use crate::types::{RateLimiterOptions, WorkerOptions, DEFAULT_MAX_EVENTS};
+use crate::types::{MetricsOptions, RateLimiterOptions, WorkerOptions, DEFAULT_MAX_EVENTS};
 
 const MARKER_BLOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_CONN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(6);
@@ -680,6 +680,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             task_lock_duration,
                                             attempts,
                                             limiter.as_ref(),
+                                            max_metrics_size,
                                         )
                                         .await
                                         {
@@ -815,6 +816,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                                 task_lock_duration,
                                                 new_attempts,
                                                 limiter.as_ref(),
+                                                max_metrics_size,
                                             )
                                             .await
                                             {
@@ -995,6 +997,13 @@ impl WorkerBuilder {
     /// including Node.js BullMQ workers.
     pub fn limiter(mut self, limiter: RateLimiterOptions) -> Self {
         self.options.limiter = Some(limiter);
+        self
+    }
+
+    /// Enable per-minute metrics collection for finished jobs
+    /// (default: disabled). Read back with `Queue::get_metrics`.
+    pub fn metrics(mut self, metrics: MetricsOptions) -> Self {
+        self.options.metrics = Some(metrics);
         self
     }
 

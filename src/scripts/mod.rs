@@ -63,6 +63,9 @@ impl ScriptLoader {
         register!("changePriority", "changePriority-7.lua");
         register!("promote", "promote-9.lua");
         register!("moveJobsToWait", "moveJobsToWait-8.lua");
+        register!("cleanJobsInSet", "cleanJobsInSet-3.lua");
+        register!("obliterate", "obliterate-2.lua");
+        register!("getMetrics", "getMetrics-2.lua");
 
         Self { scripts }
     }
@@ -213,6 +216,9 @@ mod tests {
         assert!(loader.scripts.contains_key("changePriority"));
         assert!(loader.scripts.contains_key("promote"));
         assert!(loader.scripts.contains_key("moveJobsToWait"));
-        assert_eq!(loader.scripts.len(), 15);
+        assert!(loader.scripts.contains_key("cleanJobsInSet"));
+        assert!(loader.scripts.contains_key("obliterate"));
+        assert!(loader.scripts.contains_key("getMetrics"));
+        assert_eq!(loader.scripts.len(), 18);
     }
 }
