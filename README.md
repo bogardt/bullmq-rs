@@ -1,8 +1,7 @@
 # bullmq-rs
-
 [![crates.io](https://img.shields.io/crates/v/bullmq-rs.svg)](https://crates.io/crates/bullmq-rs)
 [![docs.rs](https://img.shields.io/docsrs/bullmq-rs)](https://docs.rs/bullmq-rs)
-[![CI](https://github.com/bogardt/bullmq-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/bogardt/bullmq-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/bogardt/bullmq-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bogardt/bullmq-rs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/bullmq-rs.svg)](#license)
 
 A Rust implementation of [BullMQ](https://bullmq.io/) — a Redis-based
