@@ -117,6 +117,86 @@ pub struct JobOptions {
     pub timestamp: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct JobOptionsBuilder {
+    pub priority: Option<u32>,
+    pub delay: Option<Duration>,
+    pub attempts: Option<u32>,
+    pub backoff: Option<BackoffStrategy>,
+    pub ttl: Option<Duration>,
+    pub job_id: Option<String>,
+    pub deduplication: Option<DeduplicationOptions>,
+    pub repeat: Option<RepeatOptions>,
+    pub prev_millis: Option<u64>,
+    pub repeat_job_key: Option<String>,
+    pub timestamp: Option<u64>,
+}
+
+impl JobOptionsBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn priority(mut self, priority: u32) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+    pub fn delay(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
+        self
+    }
+    pub fn attempts(mut self, attempts: u32) -> Self {
+        self.attempts = Some(attempts);
+        self
+    }
+    pub fn backoff(mut self, backoff: BackoffStrategy) -> Self {
+        self.backoff = Some(backoff);
+        self
+    }
+    pub fn ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+    pub fn job_id(mut self, job_id: String) -> Self {
+        self.job_id = Some(job_id);
+        self
+    }
+    pub fn deduplication(mut self, deduplication: DeduplicationOptions) -> Self {
+        self.deduplication = Some(deduplication);
+        self
+    }
+    pub fn repeat(mut self, repeat: RepeatOptions) -> Self {
+        self.repeat = Some(repeat);
+        self
+    }
+    pub fn prev_millis(mut self, prev_millis: u64) -> Self {
+        self.prev_millis = Some(prev_millis);
+        self
+    }
+    pub fn repeat_job_key(mut self, repeat_job_key: String) -> Self {
+        self.repeat_job_key = Some(repeat_job_key);
+        self
+    }
+    pub fn timestamp(mut self, timestamp: u64) -> Self {
+        self.timestamp = Some(timestamp);
+        self
+    }
+    pub fn build(self) -> JobOptions {
+        JobOptions {
+            priority: self.priority,
+            delay: self.delay,
+            attempts: self.attempts,
+            backoff: self.backoff,
+            ttl: self.ttl,
+            job_id: self.job_id,
+            deduplication: self.deduplication,
+            repeat: self.repeat,
+            prev_millis: self.prev_millis,
+            repeat_job_key: self.repeat_job_key,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
 /// Repeat options for a job scheduler (repeatable job).
 ///
 /// Exactly one of [`pattern`](Self::pattern) (cron) or [`every`](Self::every)
@@ -158,6 +238,74 @@ pub struct RepeatOptions {
     /// Iteration counter. Managed by the scheduler.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RepeatOptionsBuilder {
+    pattern: Option<String>,
+    every: Option<Duration>,
+    limit: Option<u64>,
+    start_date: Option<u64>,
+    end_date: Option<u64>,
+    tz: Option<String>,
+    immediately: bool,
+    offset: Option<u64>,
+    count: Option<u64>,
+}
+
+impl RepeatOptionsBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn pattern(mut self, pattern: &str) -> Self {
+        self.pattern = Some(pattern.to_string());
+        self
+    }
+    pub fn every(mut self, every: Duration) -> Self {
+        self.every = Some(every);
+        self
+    }
+    pub fn limit(mut self, limit: u64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+    pub fn start_date(mut self, start_date: u64) -> Self {
+        self.start_date = Some(start_date);
+        self
+    }
+    pub fn end_date(mut self, end_date: u64) -> Self {
+        self.end_date = Some(end_date);
+        self
+    }
+    pub fn tz(mut self, tz: &str) -> Self {
+        self.tz = Some(tz.to_string());
+        self
+    }
+    pub fn immediately(mut self, immediately: bool) -> Self {
+        self.immediately = immediately;
+        self
+    }
+    pub fn offset(mut self, offset: u64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+    pub fn count(mut self, count: u64) -> Self {
+        self.count = Some(count);
+        self
+    }
+    pub fn build(self) -> RepeatOptions {
+        RepeatOptions {
+            pattern: self.pattern,
+            every: self.every,
+            limit: self.limit,
+            start_date: self.start_date,
+            end_date: self.end_date,
+            tz: self.tz,
+            immediately: self.immediately,
+            offset: self.offset,
+            count: self.count,
+        }
+    }
 }
 
 /// Job template applied to every job produced by a job scheduler.
