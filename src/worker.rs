@@ -500,6 +500,11 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                         break;
                     }
 
+                    // Concurrency slot reserved by the fetch path before it
+                    // claims a job; consumed by the spawn below. Dropping it
+                    // (any `continue`) releases the slot.
+                    let mut fetch_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+
                     // Check fast-path channel first (next job from moveToFinished).
                     let fast_path_result = {
                         let mut rx = next_job_rx.lock().await;
@@ -532,6 +537,26 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             }
                             continue;
                         }
+
+                        // Reserve a concurrency slot BEFORE fetching. Claiming
+                        // a job (moveToActive) locks it in Redis, but lock
+                        // renewal only starts once the job task is spawned:
+                        // claiming first and then blocking on the semaphore
+                        // left the claimed job's lock to expire while it waited
+                        // for a permit, so the stalled checker re-queued it and
+                        // the job ran twice. Permit-first means a claimed job
+                        // always starts immediately, and a saturated worker
+                        // leaves markers for other workers instead of consuming
+                        // them.
+                        fetch_permit = Some(tokio::select! {
+                            p = semaphore.clone().acquire_owned() => {
+                                match p {
+                                    Ok(permit) => permit,
+                                    Err(_) => break, // Semaphore closed
+                                }
+                            },
+                            _ = shutdown_rx.changed() => break,
+                        });
 
                         // BZPOPMIN on the marker key with 5-second timeout.
                         let bzpopmin_result: redis::RedisResult<redis::Value> =
@@ -761,6 +786,8 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                     // If we have a job result from moveToActive, process it.
                     if let Some(result) = move_result {
                         if let Some(ttl) = result.rate_limit_ttl {
+                            // No job was claimed; free the slot before sleeping.
+                            drop(fetch_permit.take());
                             let _ = events_tx.send(WorkerEvent::RateLimited { ttl_ms: ttl });
                             // Rate limited: sleep until the limiter window expires
                             // (bounded; the next moveToActive re-checks the TTL).
@@ -792,6 +819,15 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                             job_id,
                                             e
                                         );
+                                        // A prefetched job was registered for
+                                        // lock renewal at claim time; unregister
+                                        // it so its lock can expire and the
+                                        // stalled checker can recover it.
+                                        // (No-op for fetch-path jobs.)
+                                        {
+                                            let mut set = active_jobs.lock().await;
+                                            set.remove(&job_id);
+                                        }
                                         continue;
                                     }
                                 };
@@ -807,15 +843,23 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                             job.lock_token = Some(token.clone());
                             job.state = crate::types::JobState::Active;
 
-                            // Acquire a semaphore permit (may block if at concurrency limit).
-                            let permit = tokio::select! {
-                                p = semaphore.clone().acquire_owned() => {
-                                    match p {
-                                        Ok(permit) => permit,
-                                        Err(_) => break, // Semaphore closed
-                                    }
+                            // The fetch path reserved its slot before claiming.
+                            // Fast-path (prefetched) jobs arrive without one and
+                            // may block here at the concurrency limit: that is
+                            // safe because they were registered in active_jobs
+                            // when prefetched, so their lock keeps being renewed
+                            // while they wait.
+                            let permit = match fetch_permit.take() {
+                                Some(permit) => permit,
+                                None => tokio::select! {
+                                    p = semaphore.clone().acquire_owned() => {
+                                        match p {
+                                            Ok(permit) => permit,
+                                            Err(_) => break, // Semaphore closed
+                                        }
+                                    },
+                                    _ = shutdown_rx.changed() => break,
                                 },
-                                _ = shutdown_rx.changed() => break,
                             };
 
                             // Spawn the job processing task.
@@ -928,7 +972,18 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                                 ),
                                             ) => {
                                                 // Fast-path: send next job via channel.
-                                                if next.job_id.is_some() {
+                                                if let Some(next_id) = next.job_id.clone() {
+                                                    // The prefetched job is already
+                                                    // claimed and locked in Redis, but
+                                                    // it may wait in the channel longer
+                                                    // than lock_duration before the main
+                                                    // loop gets a permit. Register it
+                                                    // for lock renewal now, before it
+                                                    // is spawned.
+                                                    {
+                                                        let mut set = active_jobs.lock().await;
+                                                        set.insert(next_id.clone());
+                                                    }
                                                     task_prefetched.fetch_add(
                                                         1,
                                                         std::sync::atomic::Ordering::SeqCst,
@@ -938,6 +993,10 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Worker<T> 
                                                             1,
                                                             std::sync::atomic::Ordering::SeqCst,
                                                         );
+                                                        {
+                                                            let mut set = active_jobs.lock().await;
+                                                            set.remove(&next_id);
+                                                        }
                                                         tracing::warn!(
                                                             "Fast-path channel full, prefetched job will be recovered via stalled check: {:?}",
                                                             e.into_inner().job_id
