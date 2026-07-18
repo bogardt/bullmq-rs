@@ -55,6 +55,7 @@ flow behavior needed for real interoperability between Rust and Node:
 - `upsert_job_scheduler`, `get_job_scheduler`, `get_job_schedulers`,
   `remove_job_scheduler`
 - `get_next_job`, `extend_job_locks` (manual processing)
+- `rate_limit`, `remove_rate_limit_key` (dynamic queue-level rate limiting)
 
 ### Worker/runtime behavior
 
@@ -62,7 +63,10 @@ flow behavior needed for real interoperability between Rust and Node:
 - Token-based job locks with lock extension and stalled job recovery
 - `moveToFinished` fast-path with prefetch-safe dispatch
 - Startup and timeout recovery for missed markers / pre-existing backlog
-- Rate limiting (`WorkerOptions::limiter`, shared `limiter` key)
+- Rate limiting (`WorkerOptions::limiter`, shared `limiter` key), dynamic
+  `WorkerHandle::rate_limit()` (mirrors `worker.rateLimit()`), and the manual
+  rate-limit error (`BullmqError::RateLimited` moves the job back to wait
+  without consuming an attempt, mirroring Node `moveLimitedBackToWait`)
 - Metrics collection (`WorkerOptions::metrics`)
 - Automatic rescheduling of repeatable jobs (next iteration on finish)
 - `WorkerHandle`: `pause(do_not_wait_active)`, `resume`, `is_paused`,
@@ -107,15 +111,18 @@ flow behavior needed for real interoperability between Rust and Node:
 
 ## Known gaps
 
-### Rate limiting
+### Global concurrency
 
-- Dynamic `queue.rateLimit()` / `worker.rateLimit()` and the manual
-  rate-limit error are not ported (worker-level `limiter` option only)
+- No `Queue.set_global_concurrency` / `get_global_concurrency` API
+- The add-side Lua honors a `meta.concurrency` field set by Node
+  (`getTargetQueueList` routes and signals markers accordingly), but the
+  ported `moveToActive-11.lua` does not check it — a Rust worker will not
+  enforce a cap set via Node's `queue.setGlobalConcurrency()`
 
 ### Deduplication
 
 - `replace` / `extend` / `keepLastIfActive` modes are not exposed
-- Removing a job does not proactively clear a still-live TTL'd dedup key
+  (`DeduplicationOptions` is `{ id, ttl }` only)
 
 ### Scheduler
 
@@ -124,18 +131,31 @@ flow behavior needed for real interoperability between Rust and Node:
 
 ### Worker
 
-- `cancel_job` aborts the processing future; there is no cooperative
-  `AbortSignal` equivalent — the cancelled job is requeued via stalled
-  recovery
+- A cancelled job (`cancel_job` triggers the handler's
+  `CancellationToken`, then drops the future after a grace period) is
+  requeued via stalled recovery rather than being finished immediately
 - Node's stringly-typed worker `EventEmitter` is replaced by the typed
   `WorkerEvent` broadcast (`WorkerHandle::subscribe`); lagging subscribers
   skip events (broadcast semantics, `RecvError::Lagged`) — use
   `QueueEvents` for the cross-process stream
 
+### Manual processing
+
+- `Job.moveToWaitingChildren` is not ported
+
+### Telemetry
+
+- The BullMQ v5 telemetry interface (OpenTelemetry-style spans around
+  queue and worker operations) is not ported
+
 ### Advanced Flows surface
 
 - `getFlow(...)`, dependency pagination / cursors
 - ignored / failed dependency buckets and failure-policy variants
+
+### Queue
+
+- `Queue::remove` keeps children (Node defaults to `removeChildren: true`)
 
 ### Out of scope (design discussion first)
 
@@ -146,5 +166,5 @@ flow behavior needed for real interoperability between Rust and Node:
 - `cargo test --test unit_tests` — 39 tests
 - `cargo test --lib` — 9 tests
 - `cargo test --test integration_tests -- --ignored --test-threads=1` —
-  82 tests against a live Redis 7
+  92 tests against a live Redis 7
 - CI `compat` job — cross-language wire checks in both directions
