@@ -242,8 +242,11 @@ pub enum BackoffStrategy {
         delay: Duration,
     },
     /// Exponential backoff with a maximum delay cap.
+    ///
+    /// Serializes as `delay` to match BullMQ Node.js's `BackoffOptions`;
+    /// `max` is a bullmq-rs extension only honored by bullmq-rs workers.
     Exponential {
-        #[serde(with = "duration_millis")]
+        #[serde(with = "duration_millis", rename = "delay")]
         base: Duration,
         #[serde(with = "duration_millis")]
         max: Duration,

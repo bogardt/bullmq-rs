@@ -79,7 +79,8 @@ flow behavior needed for real interoperability between Rust and Node:
 
 ### Job options
 
-- Priorities, delays, attempts with fixed/exponential backoff
+- Priorities, delays, attempts with fixed/exponential backoff (see
+  "Exponential backoff cap" below)
 - Custom job ids, deduplication (`DeduplicationOptions { id, ttl }`)
 - Repeat metadata on scheduler-produced jobs
 
@@ -110,6 +111,13 @@ flow behavior needed for real interoperability between Rust and Node:
   Redis 7
 
 ## Known gaps
+
+### Exponential backoff cap
+
+- `BackoffStrategy::Exponential`'s `max` field has no equivalent in BullMQ
+  Node.js's backoff engine. A bullmq-rs worker honors it as a delay cap; a
+  Node.js worker retrying the same job reads only `delay` and applies its
+  native, uncapped exponential backoff.
 
 ### Global concurrency
 

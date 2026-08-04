@@ -27,7 +27,8 @@ ecosystem tooling works out of the box against queues produced by
 - **Marker-based worker loop** with `BZPOPMIN` — no polling, no missed jobs.
 - **Token-based job locks** with TTL, lock extension, and stalled-job recovery.
 - **Priorities** (sorted-set backed), **delays**, **retries** with fixed or
-  exponential backoff.
+  exponential backoff (the `max` delay cap is a bullmq-rs extension, only
+  honored by bullmq-rs workers).
 - **Concurrency** with prefetch-safe job dispatch.
 - **Repeatable jobs / JobScheduler** — cron patterns (with IANA timezones)
   or fixed intervals, `limit`, start/end dates; workers reschedule the next
