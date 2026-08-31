@@ -80,8 +80,8 @@ pub use queue_events::{QueueEvent, QueueEvents, QueueEventsBuilder};
 pub use queue_events_producer::{QueueEventsProducer, QueueEventsProducerBuilder};
 pub use tokio_util::sync::CancellationToken;
 pub use types::{
-    BackoffStrategy, DeduplicationOptions, JobDependencies, JobOptions, JobScheduler,
+    BackoffStrategy, DeduplicationOptions, JobDependencies, JobOptions, JobOptionsBuilder, JobScheduler,
     JobSchedulerTemplate, JobState, Metrics, MetricsMeta, MetricsOptions, RateLimiterOptions,
-    RepeatOptions, WorkerOptions,
+    RepeatOptions, RepeatOptionsBuilder, WorkerOptions,
 };
 pub use worker::{Worker, WorkerBuilder, WorkerEvent, WorkerHandle};
