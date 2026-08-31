@@ -2,7 +2,7 @@
 //!
 //! See tests/compat/README.md for the full cross-language flow.
 
-use bullmq_rs::{JobOptions, JobState, QueueBuilder, RedisConnection};
+use bullmq_rs::{BackoffStrategy, JobOptions, JobState, QueueBuilder, RedisConnection};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -69,6 +69,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     println!("Added prioritized job {}", prioritized.id);
+
+    let retrying = queue
+        .add(
+            "retrying",
+            Email {
+                to: "user@example.com".into(),
+                subject: "Retry".into(),
+                body: "Produced by bullmq-rs (exponential backoff)".into(),
+            },
+            Some(JobOptions {
+                attempts: Some(3),
+                backoff: Some(BackoffStrategy::Exponential {
+                    base: Duration::from_secs(1),
+                    max: Duration::from_secs(60),
+                }),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    println!("Added job with exponential backoff {}", retrying.id);
 
     let counts = queue.get_job_counts().await?;
     let wait = *counts.get(&JobState::Wait).unwrap_or(&0);

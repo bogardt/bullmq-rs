@@ -149,6 +149,23 @@ fn test_backoff_strategy_serialization() {
     assert_eq!(restored.delay_for_attempt(5), Duration::from_secs(32));
 }
 
+#[test]
+fn test_backoff_exponential_wire_format_uses_delay_key() {
+    let strategy = BackoffStrategy::Exponential {
+        base: Duration::from_secs(1),
+        max: Duration::from_secs(60),
+    };
+    let value: serde_json::Value = serde_json::to_value(&strategy).unwrap();
+
+    assert_eq!(value["type"], "exponential");
+    assert_eq!(value["delay"], 1000);
+    assert_eq!(value["max"], 60000);
+    assert!(value.get("base").is_none());
+
+    let restored: BackoffStrategy = serde_json::from_value(value).unwrap();
+    assert_eq!(restored.delay_for_attempt(0), Duration::from_secs(1));
+}
+
 // ---------------------------------------------------------------------------
 // JobOptions tests
 // ---------------------------------------------------------------------------

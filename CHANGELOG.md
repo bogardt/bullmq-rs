@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Exponential backoff wire compatibility** — `BackoffStrategy::Exponential`
+  now serializes its delay as `delay` instead of `base`, matching BullMQ
+  Node.js's native `BackoffOptions`. Jobs with exponential backoff produced
+  by bullmq-rs were previously retried without delay by Node.js workers,
+  which don't read `base`
+  ([#23](https://github.com/bogardt/bullmq-rs/issues/23)).
+
 ## [2.2.0] — 2026-06-12
 
 ### Added

@@ -42,6 +42,7 @@ async function main() {
     if (!byName.welcome) fail("missing plain job 'welcome'");
     if (!byName.reminder) fail("missing delayed job 'reminder'");
     if (!byName.urgent) fail("missing prioritized job 'urgent'");
+    if (!byName.retrying) fail("missing retrying job 'retrying'");
 
     if (!byName.reminder.opts || !byName.reminder.opts.delay) {
       fail("delayed job 'reminder' has no delay in opts");
@@ -49,6 +50,13 @@ async function main() {
     if (!byName.urgent.opts || byName.urgent.opts.priority !== 5) {
       fail(`prioritized job 'urgent' has priority ${byName.urgent.opts && byName.urgent.opts.priority}, expected 5`);
     }
+
+    const backoff = byName.retrying.opts && byName.retrying.opts.backoff;
+    if (!backoff || backoff.type !== 'exponential') {
+      fail(`retrying job has no exponential backoff in opts: ${JSON.stringify(backoff)}`);
+    }
+    if (backoff.delay !== 1000) fail(`retrying job backoff.delay is ${backoff.delay}, expected 1000`);
+    if ('base' in backoff) fail("retrying job backoff has a 'base' key, BullMQ Node.js can't read it");
 
     console.log('SUCCESS: all bullmq-rs jobs readable by BullMQ Node.js');
   } finally {
